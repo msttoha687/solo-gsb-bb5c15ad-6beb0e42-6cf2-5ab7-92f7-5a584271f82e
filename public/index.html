@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>扫描印刷稿套色偏移校准</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header>
+    <h1>扫描印刷稿套色偏移校准</h1>
+    <p class="sub">上传参考图与扫描图 → 成对点击控制点（≥ 3 对）→ 仿射拟合（可切换稳健模式剔除误标点）→ 叠加预览、残差分析与校准图导出</p>
+  </header>
+
+  <section class="toolbar">
+    <label class="file-label">参考图
+      <input type="file" id="refFile" accept="image/*">
+    </label>
+    <label class="file-label">扫描图
+      <input type="file" id="scanFile" accept="image/*">
+    </label>
+    <button id="btnSample" type="button">载入示例图像</button>
+    <button id="btnClear" type="button">清空控制点</button>
+    <span class="spacer"></span>
+    <label class="opt-label" title="按参考图像素容差筛除外点，再对内点重新最小二乘拟合">
+      <input type="checkbox" id="robustMode"> 稳健模式
+    </label>
+    <label class="opt-label tol-label" id="tolLabel" title="残差不超过该值（参考图像素）的点对计为内点">
+      像素容差
+      <input type="number" id="tolerance" min="0" max="100" step="0.5" value="2" disabled>
+      px
+    </label>
+    <button id="btnExportMatrix" type="button" disabled>导出矩阵 JSON</button>
+    <button id="btnExportResiduals" type="button" disabled>导出残差 JSON</button>
+    <button id="btnExportImage" type="button" disabled>导出校准扫描图</button>
+    <span id="exportImgHint" class="export-hint"></span>
+  </section>
+
+  <div id="status" class="status info"></div>
+
+  <main>
+    <section class="panels">
+      <figure>
+        <figcaption>参考图 <span class="hint">点击加点 · 拖动微调 · 右键删点</span></figcaption>
+        <canvas id="refCanvas"></canvas>
+      </figure>
+      <figure>
+        <figcaption>扫描图 <span class="hint">点击加点 · 拖动微调 · 右键删点</span></figcaption>
+        <canvas id="scanCanvas"></canvas>
+      </figure>
+    </section>
+
+    <aside class="side">
+      <h2>拟合结果</h2>
+      <div id="fitPanel"></div>
+      <h2>控制点<span id="ptCount"></span></h2>
+      <table id="ptTable">
+        <thead>
+          <tr>
+            <th>#</th><th>扫描图 (x, y)</th><th>参考图 (x, y)</th><th>残差 (px)</th><th title="移除该点后重新拟合，再预测该点的参考图位置所得误差">留出验证 (px)</th><th>判定</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </aside>
+  </main>
+
+  <section class="overlay-wrap">
+    <h2>叠加预览</h2>
+    <div class="opacity-row">
+      <label for="opacity">扫描图透明度</label>
+      <input type="range" id="opacity" min="0" max="1" step="0.01" value="0.5">
+      <span id="opacityVal">50%</span>
+    </div>
+    <canvas id="overlayCanvas"></canvas>
+  </section>
+
+  <section class="diff-wrap">
+    <h2>差异区域</h2>
+    <div class="diff-controls">
+      <label class="opt-label tol-label" title="双方 alpha 均不低于 128 的参与像素中，任一 RGB 通道差值的绝对值超过该值即标为差异（0~255，严格大于）">
+        色差阈值
+        <input type="number" id="diffThreshold" min="0" max="255" step="1" value="32">
+      </label>
+      <label class="opt-label tol-label" title="八邻域连通分组后，像素数小于该值的差异区域将被过滤（0 表示不过滤）">
+        最小面积
+        <input type="number" id="diffMinArea" min="0" step="1" value="20">
+        px
+      </label>
+      <span id="diffStats" class="diff-stats"></span>
+      <span id="diffHint" class="export-hint"></span>
+    </div>
+    <div class="diff-body">
+      <figure class="diff-view">
+        <figcaption>差异视图 <span class="hint">红底＝差异像素 · 橙框＝保留区域（按面积排序，坐标为参考图像素）</span></figcaption>
+        <canvas id="diffCanvas"></canvas>
+      </figure>
+      <div class="diff-side">
+        <table id="diffTable">
+          <thead>
+            <tr>
+              <th>#</th><th>像素数</th><th>边框 (x, y, w, h)</th><th>参考图坐标范围</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>仿射最小二乘拟合在浏览器本地完成；图像不会上传服务器。POST /api/fit 提供同样的拟合接口供程序化调用。</p>
+  </footer>
+
+  <script src="js/affine.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
