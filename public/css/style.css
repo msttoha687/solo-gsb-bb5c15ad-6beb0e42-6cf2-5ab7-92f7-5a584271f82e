@@ -230,5 +230,67 @@ button.del {
 .diff-side table { font-size: 12px; }
 .diff-side td, .diff-side th { padding: 4px 6px; }
 .diff-side .diff-empty { color: var(--muted); font-size: 13px; padding: 12px 4px; }
+.diff-side tbody tr { cursor: pointer; }
+.diff-side tbody tr:hover td { background: rgba(56, 189, 248, 0.08); }
+.diff-side tbody tr.selected td { background: rgba(56, 189, 248, 0.18); }
+.diff-side td.cell-note {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+/* 人工复核徽章与区域配色 */
+.badge.rev-defect { color: #fff; background: #dc2626; }
+.badge.rev-accept { color: #052e16; background: #22c55e; }
+.badge.rev-none { color: var(--muted); background: transparent; border: 1px solid var(--border); }
+
+.review-panel {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.review-panel[hidden] { display: none; }
+.review-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+.review-meta { color: var(--muted); font-size: 12px; }
+.review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.rv-btn { padding: 6px 12px; font-size: 13px; }
+.rv-btn.active-defect { border-color: #ef4444; color: #fff; background: #dc2626; }
+.rv-btn.active-accept { border-color: #22c55e; color: #052e16; background: #22c55e; }
+.rv-clear { margin-left: auto; }
+.review-note-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.review-note-label textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 6px 8px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+}
+.review-note-label textarea:disabled { opacity: 0.4; cursor: not-allowed; }
 
 footer { margin-top: 28px; color: var(--muted); font-size: 12px; }

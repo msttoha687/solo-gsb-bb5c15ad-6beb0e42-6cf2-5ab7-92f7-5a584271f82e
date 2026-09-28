@@ -620,4 +620,149 @@ const setPx = (data, w, x, y, rgba) => {
   console.log('✓ 差异区域常量：ALPHA_MIN=128 / 默认阈值 32 / 默认最小面积 20');
 }
 
+// ---------- 人工复核继承：groupDiffRegions(collectPixels) / matchRegionsByIoU ----------
+
+// 由像素坐标构造区域匹配单元（pixels 为线性索引）
+const pxUnit = (w, pts) => {
+  let minX = Infinity, minY = Infinity, maxX = -1, maxY = -1;
+  const pixels = pts.map(([x, y]) => {
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    return y * w + x;
+  }).sort((a, b) => a - b);
+  return { minX, minY, maxX, maxY, pixelCount: pixels.length, pixels };
+};
+
+// 43. groupDiffRegions collectPixels：区域附带按索引升序的实际差异像素
+{
+  const w = 5, h = 5;
+  const mask = new Uint8Array(w * h);
+  mask[0] = 1; mask[1] = 1; mask[w] = 1; // (0,0)(1,0)(0,1) 3 像素
+  mask[4 * w + 4] = 1;                  // (4,4) 孤立像素
+  const g = Affine.groupDiffRegions(mask, w, h, 2, { collectPixels: true });
+  assert.strictEqual(g.regions.length, 1, '孤立像素被最小面积过滤');
+  const r = g.regions[0];
+  assert.ok(Array.isArray(r.pixels));
+  assert.strictEqual(r.pixels.length, r.pixelCount);
+  assert.deepStrictEqual(r.pixels, [0, 1, w], 'pixels 应为升序线性索引');
+  // 不带选项时输出不含 pixels（旧行为不变）
+  const g2 = Affine.groupDiffRegions(new Uint8Array([1]), 1, 1, 0);
+  assert.ok(!('pixels' in g2.regions[0]), '未请求时不应附带 pixels');
+  console.log('✓ groupDiffRegions collectPixels：附带升序实际差异像素，默认行为不变');
+}
+
+// 44. matchRegionsByIoU：完全相同的区域 IoU=1，唯一互配，继承
+{
+  const w = 10;
+  const A = pxUnit(w, [[2, 0], [3, 0], [4, 0]]);
+  const m = Affine.matchRegionsByIoU([A], [A]);
+  assert.strictEqual(m.pairs.length, 1);
+  assert.deepStrictEqual([m.pairs[0].oldIndex, m.pairs[0].newIndex], [0, 0]);
+  assert.strictEqual(m.pairs[0].iou, 1);
+  assert.deepStrictEqual(m.unmatchedOld, []);
+  assert.deepStrictEqual(m.unmatchedNew, []);
+  assert.strictEqual(m.minIoU, Affine.REVIEW_MIN_IOU);
+  console.log('✓ matchRegionsByIoU：相同区域 IoU=1 且互为唯一，配对继承');
+}
+
+// 45. IoU 边界 0.5：不相交 / IoU=1/3 不配对；IoU 恰好 0.5 配对
+{
+  const w = 20;
+  // 不相交：两排各 10 像素、x 范围不重叠
+  const row10 = (y, x0) => {
+    const pts = [];
+    for (let dx = 0; dx < 5; dx++) for (let dy = 0; dy < 2; dy++) pts.push([x0 + dx, y + dy]);
+    return pxUnit(w, pts);
+  };
+  let m = Affine.matchRegionsByIoU([row10(0, 0)], [row10(0, 5)]);
+  assert.strictEqual(m.pairs.length, 0, '不相交区域不配对');
+
+  // A 与 C 各 10 像素（两排 ×5），共享一排 5 像素：交集 5、并集 15 → IoU=1/3
+  const A = row10(0, 0); // y0..1, x0..4
+  const C = row10(1, 0); // y1..2, x0..4
+  m = Affine.matchRegionsByIoU([A], [C]);
+  assert.strictEqual(m.pairs.length, 0, 'IoU=1/3 < 0.5 不配对');
+  assert.deepStrictEqual(m.unmatchedOld, [0]);
+  assert.deepStrictEqual(m.unmatchedNew, [0]);
+
+  // 恰好 0.5：两条 9 像素水平线，一条 x0..8、另一条 x3..11，
+  // 交集 x3..8 共 6 像素，并集 9+9−6=12 → IoU=0.5（边界达标）
+  const line9 = (x0) => {
+    const pts = [];
+    for (let dx = 0; dx < 9; dx++) pts.push([x0 + dx, 5]);
+    return pxUnit(w, pts);
+  };
+  m = Affine.matchRegionsByIoU([line9(0)], [line9(3)]);
+  assert.strictEqual(m.pairs.length, 1, 'IoU 恰好 0.5 应配对（边界达标）');
+  assert.ok(Math.abs(m.pairs[0].iou - 0.5) < 1e-12);
+  assert.strictEqual(m.pairs[0].intersection, 6);
+  assert.strictEqual(m.pairs[0].union, 12);
+  console.log('✓ matchRegionsByIoU：IoU 边界 0.5 达标、1/3 与不相交不配对');
+}
+
+// 46. 一对多（分裂/合并）：即便两侧 IoU 均 ≥ 0.5，也不继承任何一方
+{
+  const w = 40;
+  const strip = (y0) => {
+    const pts = [];
+    for (let x = 0; x < 10; x++) pts.push([x, y0]);
+    return pts;
+  };
+  // 旧区域 A：两排共 20 像素
+  const A = pxUnit(w, strip(0).concat(strip(1)));
+  // 新区域 B（上排）/ C（下排）各 10 像素：A∩B=10, union=20, IoU=0.5
+  const B = pxUnit(w, strip(0));
+  const C = pxUnit(w, strip(1));
+  const m = Affine.matchRegionsByIoU([A], [B, C]);
+  assert.strictEqual(m.pairs.length, 0, '分裂一对多：即使 IoU=0.5 也不继承');
+  assert.deepStrictEqual(m.unmatchedOld, [0]);
+  assert.deepStrictEqual(m.unmatchedNew, [0, 1]);
+  // 反向（合并：旧两个、新一个）同样不继承
+  const m2 = Affine.matchRegionsByIoU([B, C], [A]);
+  assert.strictEqual(m2.pairs.length, 0, '合并不继承');
+  assert.deepStrictEqual(m2.unmatchedOld, [0, 1]);
+  assert.deepStrictEqual(m2.unmatchedNew, [0]);
+  console.log('✓ matchRegionsByIoU：分裂/合并一对多时双方都不继承结论');
+}
+
+// 47. 多区域并存：只配对互为唯一达标者，排序/编号变化不影响匹配
+{
+  const w = 30;
+  const blob = (cx, cy) => {
+    const pts = [];
+    for (let dy = 0; dy < 3; dy++) for (let dx = 0; dx < 3; dx++) pts.push([cx + dx, cy + dy]);
+    return pxUnit(w, pts);
+  };
+  // 旧：A=(0,0) 小、D=(20,20) 大（9 vs 16）；新：先放大的 D' 再放小的 A'（面积序翻转）
+  const A = blob(0, 0);
+  const Dpts = [];
+  for (let dy = 0; dy < 4; dy++) for (let dx = 0; dx < 4; dx++) Dpts.push([20 + dx, 20 + dy]);
+  const D = pxUnit(w, Dpts);
+  const A2 = blob(0, 0);
+  const D2 = pxUnit(w, Dpts.map(([x, y]) => [x + 1, y])); // 平移 1px：交集 3×4=12，并集 9? 16+16-12=20 → 0.6
+  // 旧数组按 [小A, 大D]，新数组按 [大D', 小A']（下标不对应）
+  const m = Affine.matchRegionsByIoU([A, D], [D2, A2]);
+  assert.strictEqual(m.pairs.length, 2, '两个独立区域各自配对');
+  const byOld = new Map(m.pairs.map((p) => [p.oldIndex, p.newIndex]));
+  assert.strictEqual(byOld.get(0), 1, '小区域配对到新数组下标 1，而非沿用编号 0');
+  assert.strictEqual(byOld.get(1), 0, '大区域配对到新数组下标 0');
+  console.log('✓ matchRegionsByIoU：按像素集合匹配，与排序编号无关');
+}
+
+// 48. matchRegionsByIoU 非法输入拒绝
+{
+  const u = pxUnit(4, [[0, 0]]);
+  assert.throws(() => Affine.matchRegionsByIoU(null, [u]), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.matchRegionsByIoU([u], {}), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.matchRegionsByIoU([{}], [u]), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.matchRegionsByIoU([u], [u], -0.1), (e) => e.code === 'BAD_INPUT');
+  assert.throws(() => Affine.matchRegionsByIoU([u], [u], 1.1), (e) => e.code === 'BAD_INPUT');
+  // 空数组合法：无配对
+  const m = Affine.matchRegionsByIoU([], []);
+  assert.deepStrictEqual(m.pairs, []);
+  console.log('✓ matchRegionsByIoU：非法输入抛 BAD_INPUT，空数组合法');
+}
+
 console.log('\n全部测试通过 ✔');

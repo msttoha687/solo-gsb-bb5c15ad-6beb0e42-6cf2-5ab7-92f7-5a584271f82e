@@ -9,8 +9,12 @@
  * transformRGBA 像素变换。「差异区域」视图端到端验证：满足条件时复用重采样
  * 结果逐像素比较、八邻域分组并按面积展示边框/像素数/坐标范围；色差阈值与
  * 最小面积调节（含非法输入）后更新或清空；拟合无效（共线）、点位变化、
- * 非法容差等条件失效时清空旧标记并说明原因。同时校验 app.js 引用的所有
- * DOM id 都存在于 index.html。
+ * 非法容差等条件失效时清空旧标记并说明原因。差异区域「人工复核」全流程：
+ * 点击差异像素/表格行选中、标缺陷/可接受并填备注、清除复核、表格结论与
+ * 统计同步、导出含坐标范围/像素数/结论/备注的复核 JSON；阈值与控制点
+ * 重算后以实际差异像素 IoU 继承结论（IoU 不足/区域消失重现不继承、
+ * 不按排序编号沿用）；更换任一图片清空全部复核记录。
+ * 同时校验 app.js 引用的所有 DOM id 都存在于 index.html。
  */
 'use strict';
 
@@ -68,22 +72,49 @@ function makeCtx(canvas) {
   });
 }
 
+function makeClassList() {
+  const set = new Set();
+  return {
+    add: (...cs) => cs.forEach((c) => set.add(c)),
+    remove: (...cs) => cs.forEach((c) => set.delete(c)),
+    toggle: (c, force) => {
+      const on = force === undefined ? !set.has(c) : !!force;
+      if (on) set.add(c); else set.delete(c);
+      return on;
+    },
+    contains: (c) => set.has(c)
+  };
+}
+
 function makeEl(tag) {
   const numericIds = new Set(['tolerance', 'diffThreshold', 'diffMinArea']);
-  return {
+  const el = {
     tag,
     listeners: {},
     _q: {},
+    classList: makeClassList(),
     className: '', textContent: '', innerHTML: '',
     // number 输入默认 0（测试中按用例显式赋值），其余控件默认 0.5（透明度滑杆）
     value: numericIds.has(tag) ? '0' : '0.5',
-    checked: false, disabled: false, files: [], dataset: {},
+    hidden: false,
+    checked: false, disabled: false, files: [], dataset: {}, title: '',
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     removeEventListener() {},
-    querySelector(sel) { return this._q[sel] || (this._q[sel] = makeEl(sel)); },
-    closest() { return null; },
-    click() {}, remove() {}, appendChild() {}, setAttribute() {}
+    querySelector(sel) {
+      if (!this._q[sel]) this._q[sel] = makeEl(sel);
+      return this._q[sel];
+    },
+    closest(sel) {
+      // 简单桩：sel 以 tag 开头时返回自身（测试中点击目标即行/按钮）
+      if (typeof sel === 'string') {
+        const name = sel.replace(/^[.#]/, '').split(/[.:[]/)[0];
+        if (name && this.tag === name) return this;
+      }
+      return null;
+    },
+    click() {}, remove() {}, appendChild() {}, setAttribute() {}, focus() {}
   };
+  return el;
 }
 
 function makeCanvas() {
@@ -102,12 +133,18 @@ const winListeners = {};
 global.window = { addEventListener(type, fn) { (winListeners[type] = winListeners[type] || []).push(fn); } };
 const fireWindow = (type, ev) => (winListeners[type] || []).forEach((fn) => fn(ev));
 global.document = {
+  activeElement: null,
   getElementById(id) {
     requestedIds.add(id);
     if (!els[id]) els[id] = id.endsWith('Canvas') ? makeCanvas() : makeEl(id);
     return els[id];
   },
-  createElement(tag) { return tag === 'canvas' ? makeCanvas() : makeEl(tag); },
+  createElement(tag) {
+    const el = tag === 'canvas' ? makeCanvas() : makeEl(tag);
+    // focus 跟踪：app.js 据此在备注输入重绘表格后恢复焦点
+    el.focus = () => { global.document.activeElement = el; };
+    return el;
+  },
   body: { appendChild() {} }
 };
 global.Affine = require('../public/js/affine.js');
@@ -119,8 +156,9 @@ global.Image = class {
   get src() { return this._src; }
   set src(v) {
     this._src = v;
-    this._isSampleImg = typeof v === 'string' && v.startsWith('data:image/png;base64,seq');
-    if (this._isSampleImg) {
+    this._isSampleImg = typeof v === 'string' &&
+      (v.startsWith('data:image/png;base64,seq') || Object.prototype.hasOwnProperty.call(pixelsBySrc, v));
+    if (v.startsWith('data:image/png;base64,seq')) {
       // loadSampleImages 中参考图先于扫描图赋 src：偶数张为参考图（黑块），奇数张为全白扫描图
       const isRef = sampleImgCounter % 2 === 0;
       sampleImgCounter++;
@@ -133,7 +171,12 @@ global.ImageData = class {
   constructor(data, width, height) { this.data = data; this.width = width; this.height = height; }
 };
 global.FileReader = class {
-  readAsDataURL() { this.result = 'data:image/png;base64,xxxx'; setImmediate(() => this.onload && this.onload()); }
+  readAsDataURL() {
+    // 上传文件桩：标记为 sample 像素中的「参考图」（黑块），供换图后重新打点复现差异
+    this.result = 'data:image/png;base64,upload-ref';
+    pixelsBySrc[this.result] = refPixels;
+    setImmediate(() => this.onload && this.onload());
+  }
 };
 const blobs = [];
 global.URL.createObjectURL = (b) => { blobs.push(b); return 'blob:fake'; };
@@ -223,7 +266,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffStats.textContent.includes('差异像素 100'), '黑块 100 像素应为差异: ' + els.diffStats.textContent);
   assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '10×10 块应连通为 1 个区域: ' + els.diffStats.textContent);
   assert.ok(els.diffStats.textContent.includes('双方 alpha ≥ 128'), '应说明 alpha 统计口径: ' + els.diffStats.textContent);
-  const diffRows = () => (els.diffTable.querySelector('tbody').innerHTML.match(/<tr>/g) || []).length;
+  const diffRows = () => (els.diffTable.querySelector('tbody').innerHTML.match(/<tr[ >]/g) || []).length;
   assert.strictEqual(diffRows(), 1);
   assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('(40, 50, 10×10)'), '应展示边框: ' + els.diffTable.querySelector('tbody').innerHTML);
   assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('x 40–49 · y 50–59'), '应展示参考图坐标范围');
@@ -267,6 +310,138 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   await flushDebounce();
   assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '恢复面积后区域应恢复: ' + els.diffStats.textContent);
   console.log('✓ 差异区域：最小面积变化后重新分组过滤；非法面积清空并说明原因');
+
+  // 2.9 人工复核：初始复核面板隐藏、导出按钮状态跟随结果；初始有结果时按钮可用
+  assert.strictEqual(els.reviewPanel.hidden, true, '未选中区域时复核面板隐藏');
+  assert.strictEqual(els.btnExportReviews.disabled, false, '存在差异结果时复核 JSON 导出应可用');
+  // 点击画布空白（白像素）→ 不选中，面板保持隐藏
+  fire(els.diffCanvas, 'mousedown', { button: 0, clientX: 300, clientY: 300, preventDefault() {} });
+  assert.strictEqual(els.reviewPanel.hidden, true, '点击非差异像素不选中区域');
+  // 点击画布内差异像素（黑块内 (45,55)）→ 选中区域 #1
+  fire(els.diffCanvas, 'mousedown', { button: 0, clientX: 45, clientY: 55, preventDefault() {} });
+  assert.strictEqual(els.reviewPanel.hidden, false, '点击差异像素应选中并显示复核面板');
+  assert.ok(els.reviewRegionIndex.textContent.includes('1'), '应选中区域 #1: ' + els.reviewRegionIndex.textContent);
+  assert.ok(els.reviewRegionMeta.textContent.includes('100 像素'), '面板应显示像素数: ' + els.reviewRegionMeta.textContent);
+  assert.strictEqual(els.reviewNote.disabled, true, '未给结论前备注输入应禁用');
+  assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('selected'), '选中行应有 selected 类');
+  console.log('✓ 人工复核：点击差异像素选中区域，显示复核面板，未判定前备注禁用');
+
+  // 2.10 标为「缺陷」+ 备注：表格结论/备注、统计与导出 JSON 同步
+  fire(els.btnReviewDefect, 'click');
+  assert.ok(els.btnReviewDefect.classList.contains('active-defect'), '缺陷按钮应有激活样式');
+  assert.strictEqual(els.reviewNote.disabled, false, '判定后备注输入应启用');
+  let tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('rev-defect'), '表格应显示缺陷徽章: ' + tableHtml);
+  assert.ok(els.diffStats.textContent.includes('已复核 1/1'), '统计应显示已复核进度: ' + els.diffStats.textContent);
+  assert.ok(els.diffStats.textContent.includes('缺陷 1 · 可接受 0'));
+  // 输入备注（实时写入，不整体重绘表格）
+  els.reviewNote.value = '套色缺失，需返工';
+  fire(els.reviewNote, 'input');
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('套色缺失，需返工'), '备注应显示在表格中: ' + tableHtml);
+  // 导出复核 JSON：含参考图坐标范围、像素数、结论、备注
+  fire(els.btnExportReviews, 'click');
+  let rvj = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(rvj.regions.length, 1);
+  assert.deepStrictEqual(rvj.regions[0].refCoordinateRange, { minX: 40, minY: 50, maxX: 49, maxY: 59 });
+  assert.strictEqual(rvj.regions[0].pixelCount, 100);
+  assert.strictEqual(rvj.regions[0].verdict, 'defect');
+  assert.strictEqual(rvj.regions[0].note, '套色缺失，需返工');
+  assert.strictEqual(rvj.review.inheritMinIoU, 0.5);
+  assert.strictEqual(rvj.review.defectCount, 1);
+  assert.strictEqual(rvj.review.acceptableCount, 0);
+  console.log('✓ 人工复核：标为缺陷并填写备注，表格/统计同步，导出含坐标范围/像素数/结论/备注的 JSON');
+
+  // 2.11 改为「可接受」再清除复核；再次点击同一行可取消选中
+  fire(els.btnReviewAccept, 'click');
+  assert.ok(els.btnReviewAccept.classList.contains('active-accept'));
+  assert.ok(!els.btnReviewDefect.classList.contains('active-defect'));
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('rev-accept'), '表格应显示可接受徽章');
+  assert.ok(!tableHtml.includes('rev-defect'));
+  // reviewedAt 等字段随结论变更仍保留
+  fire(els.btnExportReviews, 'click');
+  rvj = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(rvj.regions[0].verdict, 'acceptable');
+  fire(els.btnReviewClear, 'click');
+  assert.strictEqual(els.reviewNote.disabled, true, '清除复核后备注再次禁用');
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('未复核'), '清除后应显示未复核');
+  assert.ok(els.diffStats.textContent.includes('已复核 0/1'));
+  fire(els.btnExportReviews, 'click');
+  rvj = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(rvj.regions[0].verdict, null, '未复核区域导出 verdict=null');
+  assert.strictEqual(rvj.regions[0].note, '');
+  console.log('✓ 人工复核：可接受/缺陷可切换，清除复核后恢复未复核');
+
+  // 2.12 表格行点击选中（data-index 驱动，不依赖排序编号）
+  // 先点击画布空白取消 2.11 遗留的选中
+  fire(els.diffCanvas, 'mousedown', { button: 0, clientX: 300, clientY: 300, preventDefault() {} });
+  assert.strictEqual(els.reviewPanel.hidden, true);
+  const diffRow = {
+    tag: 'tr', listeners: {}, dataset: { index: '0' }, className: '',
+    closest(sel) { return typeof sel === 'string' && sel.includes('diff-row') ? this : null; }
+  };
+  els.diffTable.querySelector('tbody').listeners.click[0]({ target: diffRow });
+  assert.strictEqual(els.reviewPanel.hidden, false, '点击表格行应选中区域');
+  // 再次点击同一行 → 取消选中
+  els.diffTable.querySelector('tbody').listeners.click[0]({ target: diffRow });
+  assert.strictEqual(els.reviewPanel.hidden, true, '再次点击同一行取消选中');
+  console.log('✓ 人工复核：点击表格行选中/取消，依据 data-index 而非排序编号');
+
+  // 2.13 重算继承（IoU）：阈值变化使像素集合几乎不变 → 结论继承，且不按编号沿用
+  // 重新标为缺陷并写备注
+  fire(els.diffCanvas, 'mousedown', { button: 0, clientX: 45, clientY: 55, preventDefault() {} });
+  fire(els.btnReviewDefect, 'click');
+  els.reviewNote.value = '继承测试备注';
+  fire(els.reviewNote, 'input');
+  // 阈值 32→31：黑(0)/白(255) 差值仍远超阈值，区域实际差异像素完全相同（IoU=1）→ 继承
+  els.diffThreshold.value = '31';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('rev-defect'), 'IoU=1 重算后应继承缺陷结论');
+  assert.ok(tableHtml.includes('继承测试备注'), '备注应一并继承');
+  assert.ok(els.diffStats.textContent.includes('已复核 1/1'));
+  console.log('✓ 人工复核：阈值重算后以实际差异像素 IoU（=1）继承结论与备注');
+
+  // 2.14 区域消失后再出现：IoU 不达标（无对应旧像素）→ 未复核，不按排序编号沿用
+  els.diffThreshold.value = '255';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('未发现差异像素'), '阈值 255 区域消失');
+  els.diffThreshold.value = '32';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('未复核'), '区域消失后重现应显示未复核（结论未被继承）');
+  assert.ok(!tableHtml.includes('继承测试备注'), '旧备注不得沿用到新区域');
+  console.log('✓ 人工复核：区域消失后重现按未复核处理，绝不按排序编号沿用旧结论');
+
+  // 2.15 拟合变化（控制点增删）引发重算：矩阵不同但差异像素一致时仍按 IoU 继承。
+  // 新增一个落在真实映射上的第 5 对精确点 → 触发控制点重算；新增点不改变残差为 0
+  // 的拟合（矩阵不变），差异区域像素一致（IoU=1）→ 结论继承，而非按编号沿用。
+  fire(els.diffCanvas, 'mousedown', { button: 0, clientX: 45, clientY: 55, preventDefault() {} });
+  fire(els.btnReviewDefect, 'click'); // 选中区域后重新判定为缺陷
+  els.reviewNote.value = '点位重算继承';
+  fire(els.reviewNote, 'input');
+  const p5 = [700, 300];
+  clickCanvas(els.refCanvas, p5[0], p5[1]);
+  const sp5 = scanPt(p5);
+  clickCanvas(els.scanCanvas, sp5[0], sp5[1]);
+  assert.ok(els.status.textContent.includes('拟合成功'));
+  await flushDebounce();
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(els.diffStats.textContent.includes('差异像素 100'), '加点后差异应仍为 100 像素: ' + els.diffStats.textContent);
+  assert.ok(tableHtml.includes('rev-defect'), '控制点新增引发重算后同区域应继承结论: ' + tableHtml);
+  assert.ok(tableHtml.includes('点位重算继承'), '备注应继承: ' + tableHtml);
+  console.log('✓ 人工复核：控制点新增引发重算时同样按实际差异像素 IoU 继承结论');
+  // 删除该点恢复 4 对，结论仍继承
+  fire(els.refCanvas, 'contextmenu', { clientX: p5[0], clientY: p5[1], preventDefault() {} });
+  await flushDebounce();
+  tableHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(tableHtml.includes('rev-defect'), '删除控制点重算后结论仍应继承: ' + tableHtml);
+  console.log('✓ 人工复核：控制点删除引发重算后结论同样按 IoU 继承');
 
   // 3. 导出矩阵 JSON，并验证其逆映射精度
   fire(els.btnExportMatrix, 'click');
@@ -468,6 +643,39 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.strictEqual(mj3.pointCount, 5);
   assert.strictEqual(mj3.looValidation.verifiableCount, 5);
   console.log('✓ 关闭稳健模式后回到经典最小二乘（导出 mode/rmseScope 对应，留出验证同步）');
+
+  // 14. 更换任一图片 → 清空全部人工复核记录（同时清空控制点）
+  // 先让差异恢复并留下一条缺陷复核
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('差异像素 100'), '换图前先确认差异结果存在: ' + els.diffStats.textContent);
+  fire(els.diffCanvas, 'mousedown', { button: 0, clientX: 45, clientY: 55, preventDefault() {} });
+  fire(els.btnReviewDefect, 'click');
+  els.reviewNote.value = '换图前结论，必须被清空';
+  fire(els.reviewNote, 'input');
+  assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('rev-defect'), '换图前复核已记录');
+  // 重新选择一张「参考图」文件（桩像素与原参考图一致：黑块）
+  els.refFile.files = [{ name: 'new-ref.png' }];
+  fire(els.refFile, 'change', { target: els.refFile });
+  await tick(); await tick();
+  await flushDebounce(); // 换图后的差异清理由去抖触发
+  assert.strictEqual(rowCount(), 0, '换图应清空控制点');
+  assert.strictEqual(els.btnExportReviews.disabled, true, '换图后差异结果失效，复核导出应禁用');
+  assert.ok(els.diffHint.textContent.includes('图像缺失') || els.diffHint.textContent.includes('拟合无效'),
+    '换图后差异视图应说明不可用: ' + els.diffHint.textContent);
+  assert.strictEqual(els.reviewPanel.hidden, true, '换图后复核面板应隐藏');
+  // 重新打 4 对精确点使差异恢复：结论必须为「未复核」，旧备注不得出现
+  for (const rp of refPts) {
+    clickCanvas(els.refCanvas, rp[0], rp[1]);
+    const sp = scanPt(rp);
+    clickCanvas(els.scanCanvas, sp[0], sp[1]);
+  }
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('差异像素 100'), '换图后差异可重新计算: ' + els.diffStats.textContent);
+  const afterHtml = els.diffTable.querySelector('tbody').innerHTML;
+  assert.ok(afterHtml.includes('未复核'), '换图后新区域必须显示未复核: ' + afterHtml);
+  assert.ok(!afterHtml.includes('换图前结论'), '旧备注不得跨图片沿用');
+  assert.ok(els.diffStats.textContent.includes('已复核 0/1'), '换图后复核计数归零: ' + els.diffStats.textContent);
+  console.log('✓ 更换任一图片：清空全部复核记录与控制点，新区域一律未复核');
 
   console.log('\n前端冒烟测试全部通过 ✔');
 })().catch((err) => {

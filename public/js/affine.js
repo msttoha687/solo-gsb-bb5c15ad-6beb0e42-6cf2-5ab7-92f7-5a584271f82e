@@ -36,7 +36,14 @@
  * 校准扫描图，仅统计双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的像素，任一 RGB
  * 通道差值的绝对值超过色差阈值（0~255，严格大于）即标为差异像素；再对差异
  * 掩码做八邻域连通分组，过滤像素数小于最小面积的区域，剩余区域按面积降序
- * 输出边框、像素数与坐标范围。
+ * 输出边框、像素数与坐标范围。groupDiffRegions 可选收集每个区域的实际差异
+ * 像素索引（collectPixels），供重算后的人工复核继承使用。
+ *
+ * 人工复核继承（matchRegionsByIoU，可独立调用，纯像素计算）：色差阈值、
+ * 最小面积或控制点引发重算后，以区域「实际差异像素」集合计算新旧区域的
+ * 交并比（IoU）；仅当 IoU ≥ REVIEW_MIN_IOU（0.5）且双方互为唯一达标的
+ * 重叠区域时才把旧区域的复核结论继承给新区域；区域分裂 / 合并导致一对多
+ * 时任何一方都不继承，其余新区域一律显示未复核——绝不按排序编号沿用。
  */
 (function (root, factory) {
   const api = factory();
@@ -62,6 +69,9 @@
   const DEFAULT_DIFF_THRESHOLD = 32;
   // 差异区域默认最小面积（像素数小于该值的连通区域被过滤）
   const DEFAULT_DIFF_MIN_AREA = 20;
+  // 人工复核继承：新旧区域实际差异像素的交并比（IoU）下限，达标且互为唯一
+  // 重叠区域时才继承「缺陷 / 可接受」结论（0.5 表示交集至少占并集的一半）
+  const REVIEW_MIN_IOU = 0.5;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -589,15 +599,19 @@
    * @param {number} w 宽
    * @param {number} h 高
    * @param {number} [minArea=DEFAULT_DIFF_MIN_AREA] 最小面积（像素数小于该值的区域过滤）
+   * @param {{collectPixels?:boolean}} [options] collectPixels 为真时每个保留区域额外
+   *        附带 pixels：该区域全部差异像素的线性索引数组（p = y·w + x），按索引升序，
+   *        长度恰为 pixelCount，供 matchRegionsByIoU 计算新旧区域交并比
    * @returns {{regions:Array<{index:number, pixelCount:number,
    *            minX:number, minY:number, maxX:number, maxY:number,
-   *            bounds:{x:number,y:number,width:number,height:number}}>,
+   *            bounds:{x:number,y:number,width:number,height:number},
+   *            pixels?:number[]}>,
    *            totalDiffPixels:number, keptPixelCount:number,
    *            filteredCount:number, minArea:number}}
    *          坐标均为参考图像素坐标（闭区间），bounds.x/y 为左上角、width/height 为边长
    * @throws {FitError} code = BAD_INPUT
    */
-  function groupDiffRegions(mask, w, h, minArea) {
+  function groupDiffRegions(mask, w, h, minArea, options) {
     if (!mask || !Number.isInteger(w) || !Number.isInteger(h) ||
         w <= 0 || h <= 0 || mask.length !== w * h) {
       throw new FitError('BAD_INPUT', '差异掩码缺失或长度与宽高不符');
@@ -606,6 +620,7 @@
     if (!Number.isFinite(area) || area < 0 || !Number.isInteger(area)) {
       throw new FitError('BAD_INPUT', '最小面积必须为不小于 0 的整数');
     }
+    const collectPixels = !!(options && options.collectPixels);
 
     const found = [];
     let totalDiffPixels = 0;
@@ -620,11 +635,14 @@
         stack.push(seed);
         let pixelCount = 0;
         let minX = x, minY = y, maxX = x, maxY = y;
+        let pixels = null;
+        if (collectPixels) pixels = [];
         while (stack.length) {
           const p = stack.pop();
           const px = p % w, py = (p - px) / w;
           pixelCount++;
           totalDiffPixels++;
+          if (collectPixels) pixels.push(p);
           if (px < minX) minX = px; else if (px > maxX) maxX = px;
           if (py < minY) minY = py; else if (py > maxY) maxY = py;
           for (let dy = -1; dy <= 1; dy++) {
@@ -639,7 +657,11 @@
             }
           }
         }
-        if (pixelCount >= area) found.push({ pixelCount, minX, minY, maxX, maxY });
+        // 泛洪为压栈顺序收集，排序后保证按线性索引升序（IoU 双指针交集的前提）
+        if (collectPixels) pixels.sort((a, b) => a - b);
+        if (pixelCount >= area) {
+          found.push({ pixelCount, minX, minY, maxX, maxY, pixels });
+        }
       }
     }
     // 按面积降序（同面积保留扫描顺序，结果可复现）
@@ -648,7 +670,7 @@
     let keptPixelCount = 0;
     const regions = found.map((r, i) => {
       keptPixelCount += r.pixelCount;
-      return {
+      const reg = {
         index: i + 1, // 1 起编号，按面积排序
         pixelCount: r.pixelCount,
         minX: r.minX, minY: r.minY, maxX: r.maxX, maxY: r.maxY,
@@ -658,6 +680,8 @@
           width: r.maxX - r.minX + 1, height: r.maxY - r.minY + 1
         }
       };
+      if (collectPixels) reg.pixels = r.pixels;
+      return reg;
     });
     return {
       regions,
@@ -690,6 +714,110 @@
     };
   }
 
+  /**
+   * 重算后按「实际差异像素」匹配新旧区域，用于人工复核结论的继承。
+   *
+   * 对每对 (旧区域 A, 新区域 B) 以二者实际差异像素集合计算交并比：
+   *     IoU = |pixels(A) ∩ pixels(B)| / |pixels(A) ∪ pixels(B)|
+   * 仅当 IoU ≥ minIoU（默认 REVIEW_MIN_IOU = 0.5）且：
+   *   - A 是 B 一侧唯一与 A 达标的区域（B 没有第二个 IoU 达标的旧区域），
+   *   - B 也是 A 一侧唯一与 B 达标的区域（A 没有第二个 IoU 达标的新区域），
+   * 二者才配对继承结论。区域分裂 / 合并（一对多）、重叠不足或排序变化均不
+   * 配对；未配对的新区域必须显示「未复核」，不能按面积排序编号沿用结论。
+   *
+   * pixels 必须为按线性索引升序排列的数字数组（groupDiffRegions 以
+   * collectPixels: true 输出即满足）；bbox 不相交的区域对直接跳过交集计算。
+   *
+   * @param {Array<{minX:number,minY:number,maxX:number,maxY:number,pixels:number[]}>} oldRegions
+   * @param {Array<{minX:number,minY:number,maxX:number,maxY:number,pixels:number[]}>} newRegions
+   * @param {number} [minIoU=REVIEW_MIN_IOU] IoU 下限（0~1，边界达标）
+   * @returns {{pairs:Array<{oldIndex:number,newIndex:number,iou:number,
+   *            intersection:number,union:number}>,
+   *            unmatchedOld:number[], unmatchedNew:number[],
+   *            minIoU:number}}
+   *          配对按旧区域索引升序；unmatched* 为各自未配对的区域下标
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function matchRegionsByIoU(oldRegions, newRegions, minIoU) {
+    if (!Array.isArray(oldRegions) || !Array.isArray(newRegions)) {
+      throw new FitError('BAD_INPUT', '新旧区域必须为数组');
+    }
+    const limit = minIoU === undefined ? REVIEW_MIN_IOU : minIoU;
+    if (!Number.isFinite(limit) || limit < 0 || limit > 1) {
+      throw new FitError('BAD_INPUT', 'IoU 阈值必须为 0~1 的有限数字');
+    }
+    const validate = (regs, name) => {
+      for (const r of regs) {
+        if (!r || !Array.isArray(r.pixels) ||
+            !Number.isFinite(r.minX) || !Number.isFinite(r.maxX)) {
+          throw new FitError('BAD_INPUT', `${name}区域缺少实际差异像素或坐标信息`);
+        }
+      }
+    };
+    validate(oldRegions, '旧');
+    validate(newRegions, '新');
+
+    // 两升序数组的公共元素个数（双指针，线性时间）
+    const intersectionCount = (a, b) => {
+      let i = 0, j = 0, count = 0;
+      while (i < a.length && j < b.length) {
+        if (a[i] === b[j]) { count++; i++; j++; }
+        else if (a[i] < b[j]) i++;
+        else j++;
+      }
+      return count;
+    };
+
+    // 先记录所有达标的区域对（bbox 不相交直接跳过），再做「互为唯一」裁决
+    const qualifies = []; // {o, n, iou, inter, union}
+    for (let o = 0; o < oldRegions.length; o++) {
+      const A = oldRegions[o];
+      for (let n = 0; n < newRegions.length; n++) {
+        const B = newRegions[n];
+        if (A.maxX < B.minX || B.maxX < A.minX ||
+            A.maxY < B.minY || B.maxY < A.minY) continue;
+        const inter = intersectionCount(A.pixels, B.pixels);
+        if (inter === 0) continue;
+        const union = A.pixels.length + B.pixels.length - inter;
+        const iou = inter / union;
+        if (iou >= limit) qualifies.push({ o, n, iou, inter, union });
+      }
+    }
+    const oldTo = new Map(); // 旧区域 → 达标新区域列表
+    const newTo = new Map(); // 新区域 → 达标旧区域列表
+    for (const q of qualifies) {
+      if (!oldTo.has(q.o)) oldTo.set(q.o, []);
+      if (!newTo.has(q.n)) newTo.set(q.n, []);
+      oldTo.get(q.o).push(q);
+      newTo.get(q.n).push(q);
+    }
+
+    const pairs = [];
+    const matchedOld = new Set();
+    const matchedNew = new Set();
+    for (const q of qualifies) {
+      // 双方互为唯一达标的重叠区域：一对多（分裂/合并）时不继承
+      if (oldTo.get(q.o).length === 1 && newTo.get(q.n).length === 1) {
+        pairs.push({
+          oldIndex: q.o, newIndex: q.n, iou: q.iou,
+          intersection: q.inter, union: q.union
+        });
+        matchedOld.add(q.o);
+        matchedNew.add(q.n);
+      }
+    }
+    pairs.sort((p1, p2) => p1.oldIndex - p2.oldIndex);
+    const unmatchedOld = [];
+    const unmatchedNew = [];
+    for (let o = 0; o < oldRegions.length; o++) {
+      if (!matchedOld.has(o)) unmatchedOld.push(o);
+    }
+    for (let n = 0; n < newRegions.length; n++) {
+      if (!matchedNew.has(n)) unmatchedNew.push(n);
+    }
+    return { pairs, unmatchedOld, unmatchedNew, minIoU: limit };
+  }
+
   return {
     fitAffine,
     fitAffineRobust,
@@ -702,6 +830,7 @@
     buildDifferenceMask,
     groupDiffRegions,
     findDifferenceRegions,
+    matchRegionsByIoU,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
@@ -711,6 +840,7 @@
     MIN_MATRIX_DET,
     DIFF_ALPHA_MIN,
     DEFAULT_DIFF_THRESHOLD,
-    DEFAULT_DIFF_MIN_AREA
+    DEFAULT_DIFF_MIN_AREA,
+    REVIEW_MIN_IOU
   };
 });

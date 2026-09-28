@@ -26,6 +26,13 @@
  *    排序展示边框、像素数与参考图坐标范围。阈值 / 最小面积 / 点位 / 拟合模式或
  *    容差变化后去抖重算；条件失效（缺图、拟合无效、矩阵不可导出、参数非法）时
  *    清空旧标记并说明原因。全部像素处理在浏览器本地完成，图像不上传服务器。
+ *  - 差异区域「人工复核」：点击表格行或差异画布内的差异像素选中区域，标为
+ *    「缺陷」或「可接受」并填写备注；表格与画布同步展示结论。色差阈值、最小
+ *    面积或控制点引发重算时，以区域实际差异像素集合计算新旧区域交并比
+ *    （Affine.matchRegionsByIoU），仅当 IoU ≥ 0.5 且双方互为唯一重叠区域时
+ *    继承旧结论（区域分裂/合并/重叠不足不继承），其余新区域显示「未复核」，
+ *    绝不按排序编号沿用。可导出含参考图坐标范围、像素数、结论与备注的复核
+ *    JSON。更换任一图片（含载入示例）时清空全部复核记录。
  */
 (function () {
   'use strict';
@@ -48,7 +55,10 @@
     diffMinArea: Affine.DEFAULT_DIFF_MIN_AREA,     // 最小面积（小于该像素数的连通区域被过滤）
     diffTimer: null,         // 去抖句柄（拖动点位时合并重算）
     diffCache: null,         // {key, width, height, refData, calibratedData}
-    diffResult: null         // 最近一次 findDifferenceRegions 结果（条件失效时为 null）
+    diffResult: null,        // 最近一次 findDifferenceRegions 结果（条件失效时为 null）
+    // 人工复核：当前结果各区域下标的复核记录（随每次重算按实际差异像素 IoU 重建）
+    diffReviews: null,       // Map<newIndex, {verdict:'defect'|'accept', note, pixels, region, reviewedAt}>
+    diffSelectedIndex: null  // 当前选中区域在 diffResult.regions 中的下标（null 未选中）
   };
 
   const HIT_RADIUS_CSS = 12;   // 命中半径（CSS 像素）
@@ -58,9 +68,14 @@
   const COLOR_PENDING = '#eab308';
   const DIFF_DEBOUNCE_MS = 80;      // 差异重算去抖（拖动时合并）
   const COLOR_DIFF = '#ef4444';     // 差异像素：红
-  const COLOR_DIFF_BOX = '#f59e0b'; // 保留区域边框：橙
+  const COLOR_DIFF_BOX = '#f59e0b'; // 未复核保留区域边框：橙
+  const COLOR_REVIEW_DEFECT = '#ef4444';  // 复核「缺陷」区域边框：红
+  const COLOR_REVIEW_ACCEPT = '#22c55e';  // 复核「可接受」区域边框：绿
+  const COLOR_DIFF_SELECTED = '#38bdf8';  // 当前选中区域边框：青
   const DIFF_MASK_ALPHA = 0.55;     // 差异掩码叠加不透明度
   const DIFF_MAX_TABLE_ROWS = 200;  // 区域表最多列出的行数
+  const VERDICT_DEFECT = 'defect';
+  const VERDICT_ACCEPT = 'accept';
 
   // ---------- DOM ----------
   const $ = (id) => document.getElementById(id);
@@ -87,6 +102,14 @@
   const diffTableBody = $('diffTable').querySelector('tbody');
   const diffThresholdInput = $('diffThreshold');
   const diffMinAreaInput = $('diffMinArea');
+  const btnExportReviews = $('btnExportReviews');
+  const reviewPanel = $('reviewPanel');
+  const reviewRegionIndexEl = $('reviewRegionIndex');
+  const reviewRegionMetaEl = $('reviewRegionMeta');
+  const reviewNoteInput = $('reviewNote');
+  const btnReviewDefect = $('btnReviewDefect');
+  const btnReviewAccept = $('btnReviewAccept');
+  const btnReviewClear = $('btnReviewClear');
 
   // ---------- 图像加载 ----------
   function loadImageFromFile(file) {
@@ -109,6 +132,7 @@
     try {
       const img = await loadImageFromFile(file);
       if (which === 'ref') state.refImg = img; else state.scanImg = img;
+      clearReviews(); // 更换任一图片：旧差异区域与复核结论全部失效
       clearPoints(); // 图像更换后旧坐标失效，清空控制点
     } catch (err) {
       setStatus(err.message, 'error');
@@ -716,7 +740,9 @@
     return state.diffCache;
   }
 
-  // 条件失效 / 参数非法时清空旧标记并说明原因
+  // 条件失效 / 参数非法时清空旧标记并说明原因。
+  // 注意：保留 state.diffReviews —— 条件恢复后的重算仍按实际差异像素 IoU 继承；
+  // 复核记录只在「更换任一图片」时由 clearReviews() 显式清空。
   function clearDiff(reason) {
     if (state.diffTimer !== null) {
       clearTimeout(state.diffTimer);
@@ -724,10 +750,73 @@
     }
     state.diffResult = null;
     state.diffCache = null;
+    state.diffSelectedIndex = null;
     diffStatsEl.textContent = '';
     diffTableBody.innerHTML = '';
     diffHintEl.textContent = reason ? '差异区域暂不可用：' + reason : '';
+    btnExportReviews.disabled = true;
     drawDiffView();
+    renderReviewPanel();
+  }
+
+  // 更换任一图片（含载入示例）时清空全部人工复核记录
+  function clearReviews() {
+    state.diffReviews = null;
+    state.diffSelectedIndex = null;
+  }
+
+  // 重算后按区域「实际差异像素」交并比继承复核结论：
+  // 仅 IoU ≥ 0.5 且双方互为唯一达标重叠区域时继承（matchRegionsByIoU），
+  // 分裂/合并/重叠不足的新区域一律无结论（未复核），绝不按排序编号沿用。
+  // oldReviews 中每条记录自带旧区域的实际差异像素，因此条件短暂失效
+  //（参数非法等）期间结论仍保留，待下一次有效重算时再匹配或丢弃。
+  function inheritReviews(oldReviews, newRegions) {
+    const next = new Map();
+    let nextSelected = null;
+    if (oldReviews && oldReviews.size > 0) {
+      // 旧匹配单元：已复核区域的实际差异像素与坐标（存于复核记录中）
+      const oldUnits = [];
+      const oldKeys = []; // 与 oldUnits 对齐的旧 Map 键（旧结果下标）
+      oldReviews.forEach((rev, key) => {
+        if (rev && Array.isArray(rev.pixels) && rev.region) {
+          oldKeys.push(key);
+          oldUnits.push({
+            minX: rev.region.minX, minY: rev.region.minY,
+            maxX: rev.region.maxX, maxY: rev.region.maxY,
+            pixelCount: rev.region.pixelCount,
+            pixels: rev.pixels
+          });
+        }
+      });
+      const matched = Affine.matchRegionsByIoU(oldUnits, newRegions, Affine.REVIEW_MIN_IOU);
+      const pairByOldPos = new Map(matched.pairs.map((p) => [p.oldIndex, p]));
+      oldUnits.forEach((unit, pos) => {
+        const pair = pairByOldPos.get(pos);
+        if (!pair) return; // 旧区域无唯一达标新区域：结论丢弃
+        const n = pair.newIndex;
+        const reg = newRegions[n];
+        const rev = oldReviews.get(oldKeys[pos]);
+        next.set(n, {
+          verdict: rev.verdict,
+          note: rev.note,
+          reviewedAt: rev.reviewedAt,
+          pixels: reg.pixels, // 像素集合更新为新区域实际差异像素
+          region: regionSnapshot(reg)
+        });
+        if (state.diffSelectedIndex === oldKeys[pos]) nextSelected = n;
+      });
+    }
+    return { reviews: next, selectedIndex: nextSelected };
+  }
+
+  // 可序列化的区域摘要（导出/记录用）
+  function regionSnapshot(reg) {
+    return {
+      index: reg.index,
+      pixelCount: reg.pixelCount,
+      minX: reg.minX, minY: reg.minY, maxX: reg.maxX, maxY: reg.maxY,
+      bounds: { x: reg.bounds.x, y: reg.bounds.y, width: reg.bounds.width, height: reg.bounds.height }
+    };
   }
 
   function runDiffUpdate() {
@@ -751,7 +840,12 @@
       );
       // 分组会就地清空掩码，先据此生成红色差异覆盖层（离屏 canvas）
       const overlay = makeMaskOverlay(built.mask, w, h);
-      const grouped = Affine.groupDiffRegions(built.mask, w, h, params.minArea);
+      // collectPixels：保留每个区域的实际差异像素，供重算后 IoU 继承与画布命中
+      const oldReviews = state.diffReviews;
+      const grouped = Affine.groupDiffRegions(built.mask, w, h, params.minArea, { collectPixels: true });
+      const inherited = inheritReviews(oldReviews, grouped.regions);
+      state.diffReviews = inherited.reviews;
+      state.diffSelectedIndex = inherited.selectedIndex;
       state.diffResult = {
         width: w,
         height: h,
@@ -766,9 +860,11 @@
         overlay
       };
       diffHintEl.textContent = '';
+      btnExportReviews.disabled = false;
       drawDiffView();
       renderDiffStats();
       renderDiffTable();
+      renderReviewPanel();
     } catch (err) {
       clearDiff(err.message || String(err));
     }
@@ -794,6 +890,13 @@
     drawPlaceholder(diffCanvas, text);
   }
 
+  // 区域边框颜色：未复核橙 · 缺陷红 · 可接受绿；当前选中区域再覆一圈青色粗框
+  function regionBoxColor(reg, idx) {
+    const rev = state.diffReviews && state.diffReviews.get(idx);
+    if (!rev) return COLOR_DIFF_BOX;
+    return rev.verdict === VERDICT_DEFECT ? COLOR_REVIEW_DEFECT : COLOR_REVIEW_ACCEPT;
+  }
+
   function drawDiffView() {
     const r = state.diffResult;
     if (!r) {
@@ -813,14 +916,21 @@
     ctx.drawImage(r.overlay, 0, 0);
     ctx.globalAlpha = 1;
 
-    // 保留区域边框（橙），面积最大的若干区域标注序号（与表格一致）
+    // 保留区域边框（颜色随复核结论），面积最大的若干区域标注序号（与表格一致）
     const scale = canvasScale(diffCanvas);
-    ctx.lineWidth = 2 * scale;
-    ctx.strokeStyle = COLOR_DIFF_BOX;
     const labelEvery = r.regions.length > 60 ? Math.ceil(r.regions.length / 24) : 1;
-    r.regions.forEach((reg) => {
+    r.regions.forEach((reg, idx) => {
       const b = reg.bounds;
+      const selected = idx === state.diffSelectedIndex;
+      ctx.lineWidth = (selected ? 4 : 2) * scale;
+      ctx.strokeStyle = selected ? COLOR_DIFF_SELECTED : regionBoxColor(reg, idx);
       ctx.strokeRect(b.x, b.y, b.width, b.height);
+      if (selected) {
+        // 选中区域额外内框，突出可复核目标
+        ctx.lineWidth = 1.5 * scale;
+        ctx.strokeRect(b.x + 3 * scale, b.y + 3 * scale,
+          Math.max(b.width - 6 * scale, 1), Math.max(b.height - 6 * scale, 1));
+      }
       if (reg.index <= 24 && (reg.index - 1) % labelEvery === 0) {
         ctx.font = `bold ${12 * scale}px system-ui, sans-serif`;
         ctx.textAlign = 'left';
@@ -828,29 +938,59 @@
         ctx.lineWidth = 3 * scale;
         ctx.strokeStyle = 'rgba(0,0,0,0.75)';
         ctx.strokeText(String(reg.index), b.x + 3 * scale, b.y - 2 * scale);
-        ctx.fillStyle = COLOR_DIFF_BOX;
+        ctx.fillStyle = selected ? COLOR_DIFF_SELECTED : regionBoxColor(reg, idx);
         ctx.fillText(String(reg.index), b.x + 3 * scale, b.y - 2 * scale);
-        ctx.strokeStyle = COLOR_DIFF_BOX;
-        ctx.lineWidth = 2 * scale;
       }
     });
+  }
+
+  // HTML 转义（备注为用户输入，渲染到 innerHTML 前必须转义）
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function reviewCounts() {
+    const reviews = state.diffReviews;
+    let defect = 0, accept = 0;
+    if (reviews) {
+      reviews.forEach((rev) => {
+        if (rev.verdict === VERDICT_DEFECT) defect++;
+        else if (rev.verdict === VERDICT_ACCEPT) accept++;
+      });
+    }
+    return { defect, accept, total: defect + accept };
   }
 
   function renderDiffStats() {
     const r = state.diffResult;
     if (!r) { diffStatsEl.textContent = ''; return; }
     const pct = r.compared > 0 ? (r.diffCount / r.compared * 100) : 0;
+    let base;
     if (r.diffCount === 0) {
-      diffStatsEl.textContent =
-        `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
+      base = `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
         `色差阈值 ${r.threshold}：未发现差异像素。`;
-      return;
+    } else {
+      base = `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
+        `差异像素 ${r.diffCount}（${fmt(pct, 2)}%）· ` +
+        `保留区域 ${r.regions.length} 个、共 ${r.keptPixelCount} 像素` +
+        `（最小面积 ${r.minArea}，过滤散点 ${r.filteredCount} 像素）· 色差阈值 ${r.threshold}`;
     }
-    diffStatsEl.textContent =
-      `参与比较 ${r.compared} 像素（双方 alpha ≥ ${Affine.DIFF_ALPHA_MIN}）· ` +
-      `差异像素 ${r.diffCount}（${fmt(pct, 2)}%）· ` +
-      `保留区域 ${r.regions.length} 个、共 ${r.keptPixelCount} 像素` +
-      `（最小面积 ${r.minArea}，过滤散点 ${r.filteredCount} 像素）· 色差阈值 ${r.threshold}`;
+    // 人工复核进度：已复核 X / 区域总数（缺陷 D · 可接受 A）
+    if (r.regions.length > 0) {
+      const c = reviewCounts();
+      base += ` · 已复核 ${c.total}/${r.regions.length}` +
+        (c.total > 0 ? `（缺陷 ${c.defect} · 可接受 ${c.accept}）` : '');
+    }
+    diffStatsEl.textContent = base;
+  }
+
+  function verdictBadge(rev) {
+    if (!rev) return '<span class="badge rev-none">未复核</span>';
+    return rev.verdict === VERDICT_DEFECT
+      ? '<span class="badge rev-defect">缺陷</span>'
+      : '<span class="badge rev-accept">可接受</span>';
   }
 
   function renderDiffTable() {
@@ -858,22 +998,184 @@
     if (!r) { diffTableBody.innerHTML = ''; return; }
     if (r.regions.length === 0) {
       diffTableBody.innerHTML =
-        `<tr><td colspan="4" class="diff-empty">未发现面积 ≥ ${r.minArea} 像素的差异区域` +
+        `<tr><td colspan="6" class="diff-empty">未发现面积 ≥ ${r.minArea} 像素的差异区域` +
         `（差异像素共 ${r.diffCount}，均被最小面积过滤）。</td></tr>`;
       return;
     }
     const shown = r.regions.slice(0, DIFF_MAX_TABLE_ROWS);
-    diffTableBody.innerHTML = shown.map((g) => {
+    diffTableBody.innerHTML = shown.map((g, listIdx) => {
+      const idx = listIdx; // slice(0, N) 时列表下标即结果下标
       const b = g.bounds;
-      return `<tr>
+      const rev = state.diffReviews && state.diffReviews.get(idx);
+      const sel = idx === state.diffSelectedIndex ? ' selected' : '';
+      return `<tr class="diff-row${sel}" data-index="${idx}">
         <td>${g.index}</td>
         <td>${g.pixelCount}</td>
         <td>(${b.x}, ${b.y}, ${b.width}×${b.height})</td>
         <td>x ${g.minX}–${g.maxX} · y ${g.minY}–${g.maxY}</td>
+        <td>${verdictBadge(rev)}</td>
+        <td class="cell-note" title="${escapeHtml(rev ? rev.note : '')}">${escapeHtml(rev ? rev.note : '')}</td>
       </tr>`;
     }).join('') + (r.regions.length > DIFF_MAX_TABLE_ROWS
-      ? `<tr><td colspan="4" class="diff-empty">其余 ${r.regions.length - DIFF_MAX_TABLE_ROWS} 个区域已省略（按面积排序）</td></tr>`
+      ? `<tr><td colspan="6" class="diff-empty">其余 ${r.regions.length - DIFF_MAX_TABLE_ROWS} 个区域已省略（按面积排序，可在画布中点击复核）</td></tr>`
       : '');
+  }
+
+  // ---------- 差异区域人工复核 ----------
+  function selectedRegion() {
+    if (!state.diffResult || state.diffSelectedIndex === null) return null;
+    return state.diffResult.regions[state.diffSelectedIndex] || null;
+  }
+
+  function selectedReview() {
+    if (!state.diffReviews || state.diffSelectedIndex === null) return null;
+    return state.diffReviews.get(state.diffSelectedIndex) || null;
+  }
+
+  // 选中区域：点击表格行或画布内差异像素后调用（idx 为 diffResult.regions 下标）；
+  // 传 null 取消选中（点击画布空白处）
+  function selectRegion(idx) {
+    state.diffSelectedIndex = idx;
+    drawDiffView();
+    renderDiffTable();
+    renderReviewPanel();
+  }
+
+  // 画布点击：找到包含该差异像素的区域（八邻域分组 → 该像素所属保留区域）；
+  // 点在红底差异像素外（或落在被最小面积过滤的散点上）则取消选中
+  function hitTestDiffRegion(pos) {
+    const r = state.diffResult;
+    if (!r) return null;
+    const x = Math.floor(pos.x), y = Math.floor(pos.y);
+    if (x < 0 || y < 0 || x >= r.width || y >= r.height) return null;
+    const p = y * r.width + x;
+    for (let i = 0; i < r.regions.length; i++) {
+      const reg = r.regions[i];
+      if (x < reg.minX || x > reg.maxX || y < reg.minY || y > reg.maxY) continue;
+      // pixels 已按线性索引升序：二分判定该像素是否属于此区域
+      const arr = reg.pixels;
+      let lo = 0, hi = arr.length - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid] === p) return i;
+        if (arr[mid] < p) lo = mid + 1; else hi = mid - 1;
+      }
+    }
+    return null;
+  }
+
+  function ensureReviewMap() {
+    if (!state.diffReviews) state.diffReviews = new Map();
+    return state.diffReviews;
+  }
+
+  // 为当前选中区域记录复核结论（verdict 为 null 表示清除复核）
+  function applyVerdict(verdict) {
+    const reg = selectedRegion();
+    if (!reg) return;
+    const reviews = ensureReviewMap();
+    if (verdict === null) {
+      reviews.delete(state.diffSelectedIndex);
+    } else {
+      const prev = reviews.get(state.diffSelectedIndex);
+      reviews.set(state.diffSelectedIndex, {
+        verdict,
+        note: prev ? prev.note : '',
+        // 继承来的结论保留首次复核时间；本次新判定取当前时间
+        reviewedAt: prev ? prev.reviewedAt : new Date().toISOString(),
+        pixels: reg.pixels,
+        region: regionSnapshot(reg)
+      });
+    }
+    drawDiffView();
+    renderDiffTable();
+    renderDiffStats();
+    renderReviewPanel();
+  }
+
+  // 更新当前选中区域备注（未复核时输入框禁用，不会进入）。
+  // 整体重绘表格以同步备注列，并在文本框仍聚焦时还原光标位置，避免输入跳动失焦。
+  function updateReviewNote(note) {
+    const reg = selectedRegion();
+    if (!reg || !state.diffReviews) return;
+    const rev = state.diffReviews.get(state.diffSelectedIndex);
+    if (!rev) return;
+    rev.note = note;
+    const ta = reviewNoteInput;
+    const hadFocus = document.activeElement === ta;
+    const caret = ta.selectionStart;
+    renderDiffTable();
+    if (hadFocus) {
+      ta.focus();
+      try { ta.setSelectionRange(caret, caret); } catch (err) { /* 部分桩无此方法 */ }
+    }
+  }
+
+  function renderReviewPanel() {
+    const reg = selectedRegion();
+    if (!reg) {
+      reviewPanel.hidden = true;
+      return;
+    }
+    reviewPanel.hidden = false;
+    const rev = selectedReview();
+    reviewRegionIndexEl.textContent = '#' + reg.index;
+    reviewRegionMetaEl.textContent =
+      `${reg.pixelCount} 像素 · x ${reg.minX}–${reg.maxX} · y ${reg.minY}–${reg.maxY}` +
+      ` · 边框 (${reg.bounds.x}, ${reg.bounds.y}, ${reg.bounds.width}×${reg.bounds.height})`;
+    btnReviewDefect.classList.toggle('active-defect', !!(rev && rev.verdict === VERDICT_DEFECT));
+    btnReviewAccept.classList.toggle('active-accept', !!(rev && rev.verdict === VERDICT_ACCEPT));
+    reviewNoteInput.disabled = !rev;
+    // 仅当框内文本与记录不一致时回写，避免输入过程中光标跳动
+    if (rev && reviewNoteInput.value !== rev.note) reviewNoteInput.value = rev.note;
+    if (!rev && reviewNoteInput.value !== '') reviewNoteInput.value = '';
+    reviewNoteInput.placeholder = rev
+      ? '填写备注（可留空）'
+      : '先选择「缺陷」或「可接受」，再填写备注（可留空）';
+  }
+
+  // 导出复核 JSON：全部保留区域（未复核 verdict=null），含参考图坐标范围、
+  // 像素数、结论与备注；另附检测参数与汇总计数
+  function exportReviews() {
+    const r = state.diffResult;
+    if (!r) return;
+    const counts = reviewCounts();
+    const regions = r.regions.map((reg, idx) => {
+      const rev = state.diffReviews && state.diffReviews.get(idx);
+      return {
+        index: reg.index,
+        pixelCount: reg.pixelCount,
+        bounds: { x: reg.bounds.x, y: reg.bounds.y, width: reg.bounds.width, height: reg.bounds.height },
+        // 参考图坐标范围（闭区间，像素坐标）
+        refCoordinateRange: { minX: reg.minX, minY: reg.minY, maxX: reg.maxX, maxY: reg.maxY },
+        // 复核结论：'defect' 缺陷 / 'acceptable' 可接受 / null 未复核
+        verdict: rev ? (rev.verdict === VERDICT_DEFECT ? 'defect' : 'acceptable') : null,
+        note: rev ? rev.note : '',
+        reviewedAt: rev ? rev.reviewedAt : null
+      };
+    });
+    downloadJSON('diff-reviews.json', {
+      description: '差异区域人工复核结果：坐标均为参考图像素坐标（范围为闭区间）',
+      colorThreshold: r.threshold,
+      minArea: r.minArea,
+      width: r.width,
+      height: r.height,
+      comparedPixels: r.compared,
+      diffPixels: r.diffCount,
+      keptRegionCount: r.regions.length,
+      keptPixelCount: r.keptPixelCount,
+      filteredPixels: r.filteredCount,
+      review: {
+        reviewedCount: counts.total,
+        defectCount: counts.defect,
+        acceptableCount: counts.accept,
+        unreviewedCount: r.regions.length - counts.total,
+        // 继承规则：重算后仅当新旧区域实际差异像素 IoU ≥ 0.5 且互为唯一重叠区域时继承结论
+        inheritMinIoU: Affine.REVIEW_MIN_IOU
+      },
+      regions,
+      exportedAt: new Date().toISOString()
+    });
   }
 
   // ---------- 示例图像 ----------
@@ -925,6 +1227,7 @@
       if (loaded < 2) return;
       state.refImg = refImg;
       state.scanImg = scanImg;
+      clearReviews(); // 载入示例同样视为更换图片，清空全部复核记录
       clearPoints();
     };
     refImg.onload = done;
@@ -986,6 +1289,29 @@
       const btn = e.target.closest('button.del');
       if (btn) deletePoint(Number(btn.dataset.id));
     });
+
+    // 差异区域人工复核：表格行点击选中（按 data-index，绝不依赖排序编号做结论继承）
+    diffTableBody.addEventListener('click', (e) => {
+      const row = e.target.closest('tr.diff-row');
+      if (!row || !state.diffResult) return;
+      const idx = Number(row.dataset.index);
+      if (Number.isInteger(idx) && idx >= 0 && idx < state.diffResult.regions.length) {
+        selectRegion(state.diffSelectedIndex === idx ? null : idx);
+      }
+    });
+
+    // 画布点击差异像素 → 选中所属区域；点击空白 → 取消选中
+    diffCanvas.addEventListener('mousedown', (e) => {
+      if (e.button !== 0 || !state.diffResult) return;
+      const pos = eventToCanvas(diffCanvas, e);
+      selectRegion(hitTestDiffRegion(pos));
+    });
+
+    btnReviewDefect.addEventListener('click', () => applyVerdict(VERDICT_DEFECT));
+    btnReviewAccept.addEventListener('click', () => applyVerdict(VERDICT_ACCEPT));
+    btnReviewClear.addEventListener('click', () => applyVerdict(null));
+    reviewNoteInput.addEventListener('input', () => updateReviewNote(reviewNoteInput.value));
+    btnExportReviews.addEventListener('click', exportReviews);
 
     window.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && (state.pending.ref || state.pending.scan)) {
