@@ -598,6 +598,119 @@ const setPx = (data, w, x, y, rgba) => {
   console.log('✓ findDifferenceRegions：端到端分组排序，默认阈值/面积可覆盖');
 }
 
+// 40b. groupDiffRegions 输出每像素区域编号标签 labels（供命中与 IoU 匹配）
+{
+  const w = 5, h = 5;
+  const mask = new Uint8Array(w * h);
+  mask[0] = 1; mask[1 * w + 1] = 1;                 // 区域 A：2 像素（对角连通）
+  mask[3 * w + 3] = 1; mask[3 * w + 4] = 1;
+  mask[4 * w + 3] = 1; mask[4 * w + 4] = 1;         // 区域 B：4 像素
+  const g = Affine.groupDiffRegions(mask, w, h, 1);
+  assert.strictEqual(g.labels.length, w * h);
+  // 按面积降序：B 编号 1，A 编号 2
+  assert.strictEqual(g.labels[3 * w + 3], 1);
+  assert.strictEqual(g.labels[4 * w + 4], 1);
+  assert.strictEqual(g.labels[0], 2);
+  assert.strictEqual(g.labels[1 * w + 1], 2);
+  assert.strictEqual(g.labels[2 * w + 2], 0, '非区域像素标签为 0');
+  // 被最小面积过滤的散点标签也是 0
+  const mask2 = new Uint8Array(w * h);
+  mask2[0] = 1;                                     // 孤立像素
+  mask2[4 * w + 4] = 1; mask2[4 * w + 3] = 1;       // 2 像素区域
+  const g2 = Affine.groupDiffRegions(mask2, w, h, 2);
+  assert.strictEqual(g2.regions.length, 1);
+  assert.strictEqual(g2.labels[4 * w + 4], 1);
+  assert.strictEqual(g2.labels[0], 0, '被过滤散点标签应为 0');
+  console.log('✓ groupDiffRegions：labels 按面积排序编号，非区域/被过滤像素为 0');
+}
+
+// 40c. matchDiffRegions：以实际差异像素计算 IoU，阈值 0.5，双方互为唯一重叠
+{
+  const arr = (rows) => Uint32Array.from(rows);
+  // 同一区域、编号一致：IoU=1，匹配
+  {
+    const w = 4, h = 1;
+    const a = arr([1, 1, 0, 0]);
+    const r = Affine.matchDiffRegions(a, arr([1, 1, 0, 0]), w, h);
+    assert.strictEqual(r.matches.length, 1);
+    assert.deepStrictEqual(
+      { o: r.matches[0].oldIndex, n: r.matches[0].newIndex, iou: r.matches[0].iou },
+      { o: 1, n: 1, iou: 1 }
+    );
+  }
+  // 同一像素但新编号不同（排序变化）：必须按像素匹配而非编号沿用 → 1↔2
+  {
+    const w = 4, h = 1;
+    const r = Affine.matchDiffRegions(arr([1, 1, 0, 0]), arr([2, 2, 0, 0]), w, h);
+    assert.strictEqual(r.matches.length, 1);
+    assert.strictEqual(r.matches[0].oldIndex, 1);
+    assert.strictEqual(r.matches[0].newIndex, 2);
+    assert.strictEqual(r.matches[0].iou, 1);
+  }
+  // IoU = 5/6 ≥ 0.5：继承；交集/并集按实际像素
+  {
+    const w = 6, h = 1;
+    const oldL = arr([1, 1, 1, 1, 1, 0]); // 5 像素
+    const newL = arr([1, 1, 1, 1, 1, 1]); // 6 像素
+    const r = Affine.matchDiffRegions(oldL, newL, w, h);
+    assert.strictEqual(r.matches.length, 1);
+    assert.strictEqual(r.matches[0].intersection, 5);
+    assert.strictEqual(r.matches[0].union, 6);
+    assert.ok(Math.abs(r.matches[0].iou - 5 / 6) < 1e-12);
+  }
+  // IoU = 3/7 < 0.5：不继承
+  {
+    const w = 8, h = 1;
+    const oldL = arr([1, 1, 1, 1, 1, 0, 0, 0]); // x0..4
+    const newL = arr([0, 0, 1, 1, 1, 1, 1, 0]); // x2..6
+    const r = Affine.matchDiffRegions(oldL, newL, w, h);
+    assert.strictEqual(r.matches.length, 0, 'IoU 低于 0.5 不得继承');
+  }
+  // 一个老区域裂成两个新区域：老区域与两个新区域重叠 → 双方不互为唯一，均不继承
+  {
+    const w = 10, h = 1;
+    const oldL = arr([1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+    const newL = arr([1, 1, 1, 1, 1, 2, 2, 2, 2, 2]);
+    const r = Affine.matchDiffRegions(oldL, newL, w, h);
+    assert.strictEqual(r.matches.length, 0);
+    assert.strictEqual(r.oldOverlapCounts[1], 2, '老区域与 2 个新区域重叠');
+    assert.strictEqual(r.newOverlapCounts[1], 1);
+    assert.strictEqual(r.newOverlapCounts[2], 1);
+  }
+  // 两个老区域合并成一个新区域：同样不继承
+  {
+    const w = 10, h = 1;
+    const oldL = arr([1, 1, 1, 1, 1, 2, 2, 2, 2, 2]);
+    const newL = arr([1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+    const r = Affine.matchDiffRegions(oldL, newL, w, h);
+    assert.strictEqual(r.matches.length, 0, '合并不满足互为唯一重叠');
+  }
+  // 无任何重叠：无匹配
+  {
+    const w = 4, h = 1;
+    const r = Affine.matchDiffRegions(arr([1, 1, 0, 0]), arr([0, 0, 1, 1]), w, h);
+    assert.strictEqual(r.matches.length, 0);
+  }
+  console.log('✓ matchDiffRegions：实际像素 IoU ≥ 0.5 且互为唯一重叠才匹配（不按编号沿用）');
+}
+
+// 40d. matchDiffRegions 非法参数拒绝
+{
+  assert.throws(
+    () => Affine.matchDiffRegions(new Uint32Array(3), new Uint32Array(4), 2, 2),
+    (e) => e.code === 'BAD_INPUT'
+  );
+  assert.throws(
+    () => Affine.matchDiffRegions(new Uint32Array(4), new Uint32Array(4), 2, 2, 1.1),
+    (e) => e.code === 'BAD_INPUT'
+  );
+  assert.throws(
+    () => Affine.matchDiffRegions(null, new Uint32Array(4), 2, 2),
+    (e) => e.code === 'BAD_INPUT'
+  );
+  console.log('✓ matchDiffRegions：尺寸不符 / IoU 越界 / 缺失调 BAD_INPUT');
+}
+
 // 41. 非法参数拒绝
 {
   const ref = solidImage(2, 2, [0, 0, 0]);
@@ -617,7 +730,8 @@ const setPx = (data, w, x, y, rgba) => {
   assert.strictEqual(Affine.DIFF_ALPHA_MIN, 128);
   assert.strictEqual(Affine.DEFAULT_DIFF_THRESHOLD, 32);
   assert.strictEqual(Affine.DEFAULT_DIFF_MIN_AREA, 20);
-  console.log('✓ 差异区域常量：ALPHA_MIN=128 / 默认阈值 32 / 默认最小面积 20');
+  assert.strictEqual(Affine.REVIEW_MATCH_MIN_IOU, 0.5);
+  console.log('✓ 差异区域常量：ALPHA_MIN=128 / 默认阈值 32 / 默认最小面积 20 / 复核继承 IoU 阈值 0.5');
 }
 
 console.log('\n全部测试通过 ✔');

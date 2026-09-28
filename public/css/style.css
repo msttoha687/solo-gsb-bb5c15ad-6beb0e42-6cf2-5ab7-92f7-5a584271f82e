@@ -231,4 +231,49 @@ button.del {
 .diff-side td, .diff-side th { padding: 4px 6px; }
 .diff-side .diff-empty { color: var(--muted); font-size: 13px; padding: 12px 4px; }
 
+/* 人工复核编辑器 */
+.review-editor {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.review-editor[hidden] { display: none; }
+.review-editor h3 { font-size: 14px; margin: 0 0 4px; }
+.review-meta { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+.review-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.review-actions button { padding: 5px 10px; font-size: 12px; }
+.review-actions button.active-defect { border-color: var(--err); color: var(--err); }
+.review-actions button.active-accept { border-color: var(--ok); color: var(--ok); }
+.review-note-label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+#reviewNote {
+  width: 100%;
+  resize: vertical;
+  padding: 6px 8px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: inherit;
+}
+#reviewNote:focus { outline: none; border-color: var(--accent); }
+
+/* 差异区域复核结论 */
+.badge.defect { color: #fff; background: var(--err); }
+.badge.accept { color: #052e16; background: var(--ok); }
+.badge.pending { color: var(--text); background: var(--border); }
+.diff-side tbody tr { cursor: pointer; }
+.diff-side tbody tr.row-defect td { color: #fca5a5; }
+.diff-side tbody tr.row-accept td { color: #86efac; }
+.diff-side tbody tr.row-selected { background: rgba(56, 189, 248, 0.14); }
+.diff-side tbody tr.row-selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+td.note-cell {
+  max-width: 130px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 footer { margin-top: 28px; color: var(--muted); font-size: 12px; }

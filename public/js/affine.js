@@ -36,7 +36,14 @@
  * 校准扫描图，仅统计双方 alpha 均 ≥ DIFF_ALPHA_MIN（128）的像素，任一 RGB
  * 通道差值的绝对值超过色差阈值（0~255，严格大于）即标为差异像素；再对差异
  * 掩码做八邻域连通分组，过滤像素数小于最小面积的区域，剩余区域按面积降序
- * 输出边框、像素数与坐标范围。
+ * 输出边框、像素数与坐标范围，并给出每像素区域编号标签 labels（供点击命中
+ * 与重算时的区域交并比匹配 matchDiffRegions 使用）。
+ *
+ * 人工复核继承（matchDiffRegions，可独立调用，纯像素计算）：参数（色差阈值、
+ * 最小面积）或控制点引发重算后，新老区域一律以区域内实际差异像素计算交并比
+ * （IoU = 交集像素 / 并集像素）；仅当 IoU ≥ REVIEW_MATCH_MIN_IOU（0.5）且
+ * 双方互为唯一重叠区域（该老区域只与这一个新区域相交、反之亦然）时才配为
+ * 同一区域。绝不按排序编号沿用。
  */
 (function (root, factory) {
   const api = factory();
@@ -62,6 +69,8 @@
   const DEFAULT_DIFF_THRESHOLD = 32;
   // 差异区域默认最小面积（像素数小于该值的连通区域被过滤）
   const DEFAULT_DIFF_MIN_AREA = 20;
+  // 人工复核继承：新老区域实际差异像素交并比（IoU）不低于该值才允许继承
+  const REVIEW_MATCH_MIN_IOU = 0.5;
 
   class FitError extends Error {
     constructor(code, message) {
@@ -582,8 +591,11 @@
    *
    * 以八邻域（含对角）连通的掩码像素归为同一区域（迭代式泛洪，避免大图爆栈）；
    * 像素数 < minArea 的区域被过滤（minArea 为非负整数，0 表示不过滤）。
-   * 剩余区域按面积降序输出（面积相同按扫描到的先后排序，结果可复现）。
-   * 注意：处理过程中会就地把已访问的掩码字节置 0，调用后 mask 被清空。
+   * 剩余区域按面积降序输出（面积相同按扫描到的先后排序，结果可复现），并输出
+   * 每像素区域编号标签 labels（长度 w·h 的 Uint32Array）：保留区域内像素为该区域
+   * 的 1 起编号（与 regions[].index 一致，即按面积排序后的编号），其余像素（含
+   * 被最小面积过滤的散点）为 0，供画布点击命中与 matchDiffRegions 的 IoU 匹配使用。
+   * 注意：掩码 mask 在处理过程中会被就地置 0（labels 另行保留分组结果）。
    *
    * @param {Uint8Array} mask buildDifferenceMask 输出的每像素 1 字节掩码（会被清空）
    * @param {number} w 宽
@@ -592,6 +604,7 @@
    * @returns {{regions:Array<{index:number, pixelCount:number,
    *            minX:number, minY:number, maxX:number, maxY:number,
    *            bounds:{x:number,y:number,width:number,height:number}}>,
+   *            labels:Uint32Array,
    *            totalDiffPixels:number, keptPixelCount:number,
    *            filteredCount:number, minArea:number}}
    *          坐标均为参考图像素坐标（闭区间），bounds.x/y 为左上角、width/height 为边长
@@ -608,21 +621,24 @@
     }
 
     const found = [];
+    const labels = new Uint32Array(w * h); // 先按扫描顺序暂存组件编号，排序后重标为区域编号
     let totalDiffPixels = 0;
     const stack = [];
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const seed = y * w + x;
         if (!mask[seed]) continue;
-        // 八邻域迭代泛洪：就地清零已访问像素
+        // 八邻域迭代泛洪：掩码就地清零，组件像素在 labels 中暂记扫描顺序编号
         mask[seed] = 0;
         stack.length = 0;
         stack.push(seed);
+        const floodId = found.length + 1;
         let pixelCount = 0;
         let minX = x, minY = y, maxX = x, maxY = y;
         while (stack.length) {
           const p = stack.pop();
           const px = p % w, py = (p - px) / w;
+          labels[p] = floodId;
           pixelCount++;
           totalDiffPixels++;
           if (px < minX) minX = px; else if (px > maxX) maxX = px;
@@ -639,17 +655,29 @@
             }
           }
         }
-        if (pixelCount >= area) found.push({ pixelCount, minX, minY, maxX, maxY });
+        found.push({ floodId, pixelCount, minX, minY, maxX, maxY });
       }
     }
     // 按面积降序（同面积保留扫描顺序，结果可复现）
     found.sort((r1, r2) => r2.pixelCount - r1.pixelCount);
 
+    // 扫描顺序组件编号 → 最终区域编号（1 起，按面积排序）；被过滤组件重标为 0
+    const relabel = new Uint32Array(found.length + 1);
     let keptPixelCount = 0;
-    const regions = found.map((r, i) => {
-      keptPixelCount += r.pixelCount;
-      return {
-        index: i + 1, // 1 起编号，按面积排序
+    found.forEach((r, i) => {
+      if (r.pixelCount >= area) {
+        relabel[r.floodId] = i + 1;
+        keptPixelCount += r.pixelCount;
+      }
+    });
+    for (let p = 0; p < labels.length; p++) {
+      const id = labels[p];
+      if (id) labels[p] = relabel[id];
+    }
+    const regions = found
+      .filter((r) => r.pixelCount >= area)
+      .map((r) => ({
+        index: relabel[r.floodId], // 1 起编号，按面积排序
         pixelCount: r.pixelCount,
         minX: r.minX, minY: r.minY, maxX: r.maxX, maxY: r.maxY,
         // 边框：左上角 + 边长（坐标闭区间，width = maxX − minX + 1）
@@ -657,10 +685,10 @@
           x: r.minX, y: r.minY,
           width: r.maxX - r.minX + 1, height: r.maxY - r.minY + 1
         }
-      };
-    });
+      }));
     return {
       regions,
+      labels,
       totalDiffPixels,
       keptPixelCount,
       filteredCount: totalDiffPixels - keptPixelCount,
@@ -670,7 +698,8 @@
 
   /**
    * 一步完成「差异掩码 + 八邻域分组 + 最小面积过滤」的便捷函数。
-   * 语义与参数同 buildDifferenceMask / groupDiffRegions。
+   * 语义与参数同 buildDifferenceMask / groupDiffRegions（输出含每像素区域
+   * 编号标签 labels，供点击命中与 matchDiffRegions 的 IoU 匹配使用）。
    * @throws {FitError} code = BAD_INPUT
    */
   function findDifferenceRegions(refData, cmpData, w, h, colorThreshold, minArea) {
@@ -678,6 +707,7 @@
     const g = groupDiffRegions(m.mask, w, h, minArea);
     return {
       regions: g.regions,
+      labels: g.labels,
       compared: m.compared,
       diffCount: m.diffCount,
       totalDiffPixels: g.totalDiffPixels,
@@ -688,6 +718,97 @@
       colorThreshold: m.colorThreshold,
       minArea: g.minArea
     };
+  }
+
+  /**
+   * 以区域实际差异像素计算新老差异区域的交并比（IoU）匹配（可独立调用，纯像素
+   * 计算，不依赖 DOM/Canvas）。用于色差阈值、最小面积或控制点引发重算后决定
+   * 人工复核结论能否继承——绝不按排序编号沿用。
+   *
+   * 匹配条件（必须同时满足）：
+   *   1. 新老区域在同一 w × h 标签图上的实际像素交集非空，
+   *      IoU = 交集像素数 / 并集像素数 ≥ minIou（默认 REVIEW_MATCH_MIN_IOU = 0.5）；
+   *   2. 该老区域只与这一个新区域有像素重叠（新区域侧唯一）；
+   *   3. 该新区域也只与这一个老区域有像素重叠（老区域侧唯一），即双方互为
+   *      唯一重叠区域。
+   * 任一不满足则不配对：该新区域视为未复核，老区域的结论不被继承。
+   *
+   * 标签图由 groupDiffRegions 输出：像素值为区域的 1 起编号（按面积排序），
+   * 不属于任何保留区域的像素为 0；新老标签图必须同尺寸（通常对应同一参考图）。
+   *
+   * @param {Uint32Array|Uint8Array} oldLabels 重算前每像素区域编号（0 = 非区域）
+   * @param {Uint32Array|Uint8Array} newLabels 重算后每像素区域编号（0 = 非区域）
+   * @param {number} w 宽（正整数）
+   * @param {number} h 高（正整数）
+   * @param {number} [minIou=REVIEW_MATCH_MIN_IOU] 允许继承的最小 IoU（0~1）
+   * @returns {{matches:Array<{oldIndex:number,newIndex:number,intersection:number,
+   *            union:number,iou:number}>,
+   *            newOverlapCounts:Int32Array, oldOverlapCounts:Int32Array}}
+   *          matches 按新区域编号升序；两个计数数组下标为区域编号（0 位恒为 0），
+   *          元素值表示该区域与另一侧多少个不同区域有像素重叠
+   * @throws {FitError} code = BAD_INPUT
+   */
+  function matchDiffRegions(oldLabels, newLabels, w, h, minIou) {
+    if (!oldLabels || !newLabels || !Number.isInteger(w) || !Number.isInteger(h) ||
+        w <= 0 || h <= 0 ||
+        oldLabels.length !== w * h || newLabels.length !== w * h) {
+      throw new FitError('BAD_INPUT', '区域匹配的两张标签图缺失或长度与宽高不符');
+    }
+    const threshold = minIou === undefined ? REVIEW_MATCH_MIN_IOU : minIou;
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+      throw new FitError('BAD_INPUT', '最小交并比必须为 0~1 的数字');
+    }
+
+    let oldMax = 0, newMax = 0;
+    for (let p = 0; p < w * h; p++) {
+      const o = oldLabels[p], n = newLabels[p];
+      if (o > oldMax) oldMax = o;
+      if (n > newMax) newMax = n;
+    }
+    // oldOverlapCounts[o]：与老区域 o 有像素重叠的不同新区域个数；newOverlapCounts 反之
+    const oldOverlapCounts = new Int32Array(oldMax + 1);
+    const newOverlapCounts = new Int32Array(newMax + 1);
+    // 仅记录实际发生的 (old,new) 重叠对及其交集像素数，避免按编号平方分配内存
+    const pairKeys = new Map(); // 键 (old,new) → 在 pairs 中的下标
+    const pairs = [];           // {o, n, inter}
+    for (let p = 0; p < w * h; p++) {
+      const o = oldLabels[p], n = newLabels[p];
+      if (!o || !n) continue;
+      const key = o * (newMax + 1) + n;
+      let idx = pairKeys.get(key);
+      if (idx === undefined) {
+        idx = pairs.length;
+        pairKeys.set(key, idx);
+        pairs.push({ o, n, inter: 0 });
+        oldOverlapCounts[o]++;
+        newOverlapCounts[n]++;
+      }
+      pairs[idx].inter++;
+    }
+
+    const areaOf = (labels, max) => {
+      const a = new Int32Array(max + 1);
+      for (let p = 0; p < labels.length; p++) {
+        const v = labels[p];
+        if (v) a[v]++;
+      }
+      return a;
+    };
+    const oldArea = areaOf(oldLabels, oldMax);
+    const newArea = areaOf(newLabels, newMax);
+
+    const matches = [];
+    for (const pr of pairs) {
+      // IoU 按双方区域内实际差异像素计算：交集 / 并集
+      const union = oldArea[pr.o] + newArea[pr.n] - pr.inter;
+      const iou = union > 0 ? pr.inter / union : 0;
+      if (iou >= threshold &&
+          oldOverlapCounts[pr.o] === 1 && newOverlapCounts[pr.n] === 1) {
+        matches.push({ oldIndex: pr.o, newIndex: pr.n, intersection: pr.inter, union, iou });
+      }
+    }
+    matches.sort((m1, m2) => m1.newIndex - m2.newIndex);
+    return { matches, newOverlapCounts, oldOverlapCounts };
   }
 
   return {
@@ -702,6 +823,7 @@
     buildDifferenceMask,
     groupDiffRegions,
     findDifferenceRegions,
+    matchDiffRegions,
     FitError,
     MIN_POINTS,
     COLLINEAR_RATIO,
@@ -711,6 +833,7 @@
     MIN_MATRIX_DET,
     DIFF_ALPHA_MIN,
     DEFAULT_DIFF_THRESHOLD,
-    DEFAULT_DIFF_MIN_AREA
+    DEFAULT_DIFF_MIN_AREA,
+    REVIEW_MATCH_MIN_IOU
   };
 });

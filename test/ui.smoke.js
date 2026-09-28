@@ -70,20 +70,33 @@ function makeCtx(canvas) {
 
 function makeEl(tag) {
   const numericIds = new Set(['tolerance', 'diffThreshold', 'diffMinArea']);
-  return {
+  const el = {
     tag,
     listeners: {},
     _q: {},
     className: '', textContent: '', innerHTML: '',
-    // number 输入默认 0（测试中按用例显式赋值），其余控件默认 0.5（透明度滑杆）
-    value: numericIds.has(tag) ? '0' : '0.5',
-    checked: false, disabled: false, files: [], dataset: {},
+    // number 输入默认 0（测试中按用例显式赋值），其余控件默认 0.5（透明度滑杆）；
+    // textarea（复核备注）默认空串
+    value: numericIds.has(tag) ? '0' : (tag === 'textarea' ? '' : '0.5'),
+    checked: false, disabled: false, hidden: false, files: [], dataset: {},
+    classList: {
+      _set: new Set(),
+      add(...names) { names.forEach((n) => this._set.add(n)); },
+      remove(...names) { names.forEach((n) => this._set.delete(n)); },
+      toggle(name, force) {
+        const on = force === undefined ? !this._set.has(name) : !!force;
+        if (on) this._set.add(name); else this._set.delete(name);
+        return on;
+      },
+      contains(name) { return this._set.has(name); }
+    },
     addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
     removeEventListener() {},
     querySelector(sel) { return this._q[sel] || (this._q[sel] = makeEl(sel)); },
     closest() { return null; },
     click() {}, remove() {}, appendChild() {}, setAttribute() {}
   };
+  return el;
 }
 
 function makeCanvas() {
@@ -165,6 +178,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   // 差异区域视图：初始缺图时同样清空并说明原因，区域表为空
   assert.ok(els.diffHint.textContent.includes('图像缺失'), '差异视图应说明图像缺失: ' + els.diffHint.textContent);
   assert.strictEqual(els.diffTable.querySelector('tbody').innerHTML, '');
+  assert.strictEqual(els.btnExportReview.disabled, true, '无差异结果前导出复核按钮应禁用');
   console.log('✓ 初始渲染正常，DOM id 与 index.html 一致（导出校准扫描图禁用并说明原因）');
 
   // 1. 载入示例图像
@@ -223,7 +237,7 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.ok(els.diffStats.textContent.includes('差异像素 100'), '黑块 100 像素应为差异: ' + els.diffStats.textContent);
   assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '10×10 块应连通为 1 个区域: ' + els.diffStats.textContent);
   assert.ok(els.diffStats.textContent.includes('双方 alpha ≥ 128'), '应说明 alpha 统计口径: ' + els.diffStats.textContent);
-  const diffRows = () => (els.diffTable.querySelector('tbody').innerHTML.match(/<tr>/g) || []).length;
+  const diffRows = () => (els.diffTable.querySelector('tbody').innerHTML.match(/<tr[\s>]/g) || []).length;
   assert.strictEqual(diffRows(), 1);
   assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('(40, 50, 10×10)'), '应展示边框: ' + els.diffTable.querySelector('tbody').innerHTML);
   assert.ok(els.diffTable.querySelector('tbody').innerHTML.includes('x 40–49 · y 50–59'), '应展示参考图坐标范围');
@@ -267,6 +281,106 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   await flushDebounce();
   assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '恢复面积后区域应恢复: ' + els.diffStats.textContent);
   console.log('✓ 差异区域：最小面积变化后重新分组过滤；非法面积清空并说明原因');
+
+  // 2.9 人工复核：画布点击差异像素选中 → 标记结论与备注 → 表格/统计/导出同步
+  const diffTbodyEl = els.diffTable.querySelector('tbody'); // app.js init 时绑定事件的同一元素
+  const diffTbody = () => diffTbodyEl;
+  const clickDiffCanvas = (x, y) => fire(els.diffCanvas, 'click', { clientX: x, clientY: y });
+  // 模拟点击表格中带 data-idx 的行（事件委托靠 e.target.closest 找到行）
+  const clickDiffTableRow = (idx) => {
+    const ev = { target: { closest(sel) { return sel === 'tr[data-idx]' ? { dataset: { idx: String(idx) } } : null; } } };
+    fire(diffTbody(), 'click', ev);
+  };
+  // 点在黑块差异像素 (45,55) 上 → 选中区域 1
+  clickDiffCanvas(45, 55);
+  assert.strictEqual(els.reviewEditor.hidden, false, '选中区域后复核编辑器应显示');
+  assert.ok(els.reviewRegionNo.textContent.includes('1'));
+  assert.ok(diffTbody().innerHTML.includes('row-selected'), '选中行应高亮: ' + diffTbody().innerHTML);
+  // 点空白像素 → 取消选中；再通过表格行点击选中
+  clickDiffCanvas(200, 200);
+  assert.strictEqual(els.reviewEditor.hidden, true);
+  assert.ok(!diffTbody().innerHTML.includes('row-selected'));
+  clickDiffTableRow(1);
+  assert.strictEqual(els.reviewEditor.hidden, false, '点击表格行应选中区域');
+  assert.ok(els.reviewRegionNo.textContent.includes('1'));
+  // 备注在标记时按输入框当前内容保存：先写备注再标记可接受（无结论时 change 不建记录）
+  els.reviewNote.value = '边缘轻微偏色，可接受';
+  fire(els.reviewNote, 'change');
+  fire(els.btnVerdictAccept, 'click');
+  assert.ok(diffTbody().innerHTML.includes('可接受'), '表格应展示结论: ' + diffTbody().innerHTML);
+  assert.ok(diffTbody().innerHTML.includes('边缘轻微偏色'), '表格应展示备注');
+  assert.ok(diffTbody().innerHTML.includes('row-accept'), '可接受行应有样式类');
+  assert.ok(els.diffStats.textContent.includes('可接受 1'), '统计应含复核汇总: ' + els.diffStats.textContent);
+  assert.ok(els.diffStats.textContent.includes('未复核 0'));
+  // 清除复核 → 恢复未复核（选中保留）
+  fire(els.btnReviewClear, 'click');
+  assert.ok(diffTbody().innerHTML.includes('未复核'));
+  assert.ok(!diffTbody().innerHTML.includes('row-accept'));
+  assert.strictEqual(els.reviewEditor.hidden, false, '清除复核后选中状态应保留');
+  // 重新标为缺陷 + 备注（先标记后补备注）
+  fire(els.btnVerdictDefect, 'click');
+  els.reviewNote.value = '套色漏白，判定缺陷';
+  fire(els.reviewNote, 'change');
+  assert.ok(diffTbody().innerHTML.includes('缺陷'));
+  assert.ok(diffTbody().innerHTML.includes('套色漏白'));
+  // 导出复核 JSON：含参考图坐标范围、像素数、结论、备注
+  assert.strictEqual(els.btnExportReview.disabled, false);
+  const reviewBlobs = blobs.length;
+  fire(els.btnExportReview, 'click');
+  assert.strictEqual(blobs.length, reviewBlobs + 1, '应导出一个复核 JSON');
+  const dj = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(dj.regionCount, 1);
+  assert.strictEqual(dj.defectCount, 1);
+  assert.strictEqual(dj.pendingCount, 0);
+  assert.strictEqual(dj.colorThreshold, 32);
+  assert.strictEqual(dj.minArea, 20);
+  assert.strictEqual(dj.regions[0].pixelCount, 100);
+  assert.deepStrictEqual(dj.regions[0].refCoordinateRange, { minX: 40, minY: 50, maxX: 49, maxY: 59 });
+  assert.deepStrictEqual(dj.regions[0].bounds, { x: 40, y: 50, width: 10, height: 10 });
+  assert.strictEqual(dj.regions[0].verdict, 'defect');
+  assert.strictEqual(dj.regions[0].note, '套色漏白，判定缺陷');
+  assert.ok(typeof dj.regions[0].reviewedAt === 'string');
+  console.log('✓ 人工复核：画布差异像素/表格行选中，标缺陷/可接受+备注，表格与统计展示结论，JSON 导出');
+
+  // 2.10 复核继承：阈值引发重算，区域实际差异像素不变（IoU=1）→ 继承结论，不按编号外的规则沿用
+  els.diffThreshold.value = '100'; // 黑白差值 255 仍超过 100 → 同一黑块区域
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.ok(diffTbody().innerHTML.includes('缺陷'), 'IoU=1 时应继承缺陷结论: ' + diffTbody().innerHTML);
+  assert.ok(diffTbody().innerHTML.includes('套色漏白'), '备注应一并继承');
+  assert.ok(els.diffStats.textContent.includes('缺陷 1'), '统计应随继承结果更新: ' + els.diffStats.textContent);
+  assert.strictEqual(els.reviewEditor.hidden, false, '选中区域应随 IoU 匹配迁移保持选中');
+  // 导出仍带继承结论
+  fire(els.btnExportReview, 'click');
+  const dj2 = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(dj2.regions[0].verdict, 'defect');
+  assert.strictEqual(dj2.regions[0].note, '套色漏白，判定缺陷');
+  // 阈值调为 255 → 区域消失（未匹配）；再恢复 100 → 区域重现，但因中间无重叠快照，不得继承
+  els.diffThreshold.value = '255';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('未发现差异像素'), '阈值 255 应无差异');
+  assert.strictEqual(els.reviewEditor.hidden, true, '区域消失后选中应取消');
+  els.diffThreshold.value = '100';
+  fire(els.diffThreshold, 'input');
+  await flushDebounce();
+  assert.ok(diffTbody().innerHTML.includes('未复核'), '区域消失后重现不得沿用旧结论: ' + diffTbody().innerHTML);
+  assert.ok(!diffTbody().innerHTML.includes('套色漏白'));
+  console.log('✓ 复核继承：阈值重算且 IoU=1 时继承结论/备注/选中；区域曾消失后重现不沿用');
+
+  // 2.11 最小面积过滤导致区域消失再恢复：同样不得按编号沿用旧结论
+  clickDiffCanvas(45, 55); // 区域重现后选中状态已取消，重新点击选中
+  fire(els.btnVerdictDefect, 'click');
+  assert.ok(diffTbody().innerHTML.includes('缺陷'));
+  els.diffMinArea.value = '101';
+  fire(els.diffMinArea, 'input');
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('保留区域 0 个'));
+  els.diffMinArea.value = '20';
+  fire(els.diffMinArea, 'input');
+  await flushDebounce();
+  assert.ok(diffTbody().innerHTML.includes('未复核'), '被最小面积过滤后恢复的区域应重新复核: ' + diffTbody().innerHTML);
+  console.log('✓ 复核继承：最小面积过滤致区域消失后恢复，结论不继承');
 
   // 3. 导出矩阵 JSON，并验证其逆映射精度
   fire(els.btnExportMatrix, 'click');
@@ -468,6 +582,37 @@ const rowCount = () => (els.ptTable.querySelector('tbody').innerHTML.match(/<tr/
   assert.strictEqual(mj3.pointCount, 5);
   assert.strictEqual(mj3.looValidation.verifiableCount, 5);
   console.log('✓ 关闭稳健模式后回到经典最小二乘（导出 mode/rmseScope 对应，留出验证同步）');
+
+  // 14. 更换任一图片（含重新载入示例）→ 清空全部人工复核记录，新区域显示未复核
+  await flushDebounce(); // 当前经典模式 5 精确点：黑块差异区域存在
+  assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '前置：差异区域存在');
+  clickDiffCanvas(45, 55);
+  fire(els.btnVerdictDefect, 'click');
+  els.reviewNote.value = '换图前的复核';
+  fire(els.reviewNote, 'change');
+  assert.ok(diffTbody().innerHTML.includes('换图前的复核'), '前置：已写复核备注');
+  // 重新载入示例图像（等同更换两张图）：清空控制点与全部复核
+  fire(els.btnSample, 'click');
+  await tick(); await tick();
+  // 换图后控制点也被清空：重新打 4 对精确点，差异区域（同一样例黑块）重新出现
+  for (const rp of refPts) {
+    clickCanvas(els.refCanvas, rp[0], rp[1]);
+    const sp = scanPt(rp);
+    clickCanvas(els.scanCanvas, sp[0], sp[1]);
+  }
+  await flushDebounce();
+  assert.ok(els.diffStats.textContent.includes('保留区域 1 个'), '重打点后差异区域应重新出现');
+  assert.ok(!diffTbody().innerHTML.includes('换图前的复核'), '换图后备注必须清空');
+  assert.ok(diffTbody().innerHTML.includes('未复核'), '换图后区域应为未复核: ' + diffTbody().innerHTML);
+  assert.strictEqual(els.reviewEditor.hidden, true, '换图后不应保留选中区域');
+  assert.ok(els.diffStats.textContent.includes('未复核 1'), '换图后复核统计应重置: ' + els.diffStats.textContent);
+  // 导出 JSON 同样不含旧结论
+  fire(els.btnExportReview, 'click');
+  const djReset = JSON.parse(await blobs[blobs.length - 1].text());
+  assert.strictEqual(djReset.regions[0].verdict, null);
+  assert.strictEqual(djReset.regions[0].note, '');
+  assert.strictEqual(djReset.reviewedCount, 0);
+  console.log('✓ 更换图片（载入示例）清空全部复核记录，新区域一律未复核');
 
   console.log('\n前端冒烟测试全部通过 ✔');
 })().catch((err) => {

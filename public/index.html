@@ -88,18 +88,31 @@
         px
       </label>
       <span id="diffStats" class="diff-stats"></span>
+      <button id="btnExportReview" type="button" disabled title="导出含参考图坐标范围、像素数、复核结论与备注的 JSON">导出复核 JSON</button>
       <span id="diffHint" class="export-hint"></span>
     </div>
     <div class="diff-body">
       <figure class="diff-view">
-        <figcaption>差异视图 <span class="hint">红底＝差异像素 · 橙框＝保留区域（按面积排序，坐标为参考图像素）</span></figcaption>
+        <figcaption>差异视图 <span class="hint">红底＝差异像素 · 橙框＝未复核 · 红框＝缺陷 · 绿框＝可接受 · 加粗亮框＝当前选中；点击差异像素或表格行选中区域复核（坐标为参考图像素）</span></figcaption>
         <canvas id="diffCanvas"></canvas>
       </figure>
       <div class="diff-side">
+        <div id="reviewEditor" class="review-editor" hidden>
+          <h3>人工复核 · 区域 <span id="reviewRegionNo"></span></h3>
+          <p class="review-meta" id="reviewRegionMeta"></p>
+          <div class="review-actions">
+            <button id="btnVerdictDefect" type="button">标为「缺陷」</button>
+            <button id="btnVerdictAccept" type="button">标为「可接受」</button>
+            <button id="btnReviewClear" type="button" title="清除该区域的复核结论与备注，恢复未复核">清除复核</button>
+          </div>
+          <label class="review-note-label" for="reviewNote">备注</label>
+          <textarea id="reviewNote" rows="3" maxlength="1000" placeholder="填写复核备注（选填，随结论一起保存）"></textarea>
+        </div>
+        <p id="reviewIdle" class="diff-empty">点击画布中的差异像素或下方表格行选中区域，可标为「缺陷」或「可接受」并填写备注。</p>
         <table id="diffTable">
           <thead>
             <tr>
-              <th>#</th><th>像素数</th><th>边框 (x, y, w, h)</th><th>参考图坐标范围</th>
+              <th>#</th><th>像素数</th><th>边框 (x, y, w, h)</th><th>参考图坐标范围</th><th>结论</th><th>备注</th>
             </tr>
           </thead>
           <tbody></tbody>
